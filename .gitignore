@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+
+# Generated Prisma client
+src/generated/
+
+# Secrets: only .env.example may be committed
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store
+*.tsbuildinfo

@@ -1,0 +1,1029 @@
+// Qimam database schema: DRAFT for review, not migrated yet.
+//
+// Scope: accounts, staff roles, scopes, circles, tasks, evaluations, live sessions, transfers,
+// attendance, announcements, badges, notifications, and audit.
+// Waiting for the curriculum: daily plan, memorization log, surah gates,
+// practical application, and stage exams.
+//
+// These rules live in the first migration as raw SQL, because Prisma cannot express them:
+//   - users: STUDENT must have a phone; staff must have an email.
+//   - circle_memberships: a student has at most one row where left_at IS NULL.
+//   - evaluations.score: between 0 and max_score, and max_score > 0.
+//   - absence_warnings.level: between 1 and 3.
+//   - audit_logs: a trigger rejects every UPDATE and DELETE.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  STUDENT
+  TEACHER
+  SUPERVISOR
+  ADMIN
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum TrackId {
+  ADVANCED
+  STEADY
+  STABILIZATION
+}
+
+enum StabilizationStart {
+  KAHF
+  FATIHA
+}
+
+enum Language {
+  AR
+  EN
+}
+
+enum AdmissionStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum ConsentType {
+  TERMS_AND_PRIVACY
+  PLAN_PLEDGE
+  SERIOUSNESS_PLEDGE
+}
+
+enum OtpPurpose {
+  LOGIN
+  REGISTER
+}
+
+/// Separates tokens by audience, so a mobile token is rejected by the dashboard API and vice versa.
+enum TokenAudience {
+  MOBILE
+  DASHBOARD
+}
+
+enum NotificationType {
+  DAILY_WIRD
+  WEEKLY_REVIEW
+  NEW_TASK
+  EVALUATION
+  BADGES
+  GENERAL
+  ENCOURAGEMENT
+}
+
+enum PushPlatform {
+  IOS
+  ANDROID
+}
+
+enum TaskRecurrence {
+  ONCE
+  DAILY
+}
+
+enum LiveSessionStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  ABSENT
+  EXCUSED
+}
+
+enum SegmentStatus {
+  NEEDS_REVIEW
+  MASTERED
+}
+
+enum LiveSessionKind {
+  RECITATION
+  CORRECTION
+}
+
+enum StudentSection {
+  WOMEN
+  MEN
+}
+
+enum TrackKind {
+  MEMORIZATION
+  CORRECTION
+}
+
+enum DailyUnit {
+  HALF_PAGE
+  PAGE
+  SURAH
+}
+
+enum GateMode {
+  ACTIVE
+  RELAXED
+  TEACHER
+  PAUSED
+}
+
+enum PlanStatus {
+  ACTIVE
+  COMPLETED
+}
+
+enum GateStatus {
+  PENDING
+  PASSED
+  SKIPPED
+}
+
+enum WirdSource {
+  STUDENT
+  TEACHER
+  SKIP
+}
+
+enum SkipStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum GateExceptionType {
+  SKIP_WRAP
+  SKIP_TAFSIR
+  RELAXED_GATE
+  POSTPONE_EXAM
+}
+
+enum TranslationStatus {
+  REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum AnnouncementKind {
+  ANNOUNCEMENT
+  ALERT
+}
+
+enum DayTaskKind {
+  REVIEW
+  WRAP
+  CONSOLIDATION
+}
+
+enum TransferStatus {
+  PENDING_ADMIN
+  PENDING_TEACHER
+  COMPLETED
+  REJECTED
+  CANCELLED
+}
+
+enum AnnouncementScope {
+  ALL
+  SCOPE
+  CIRCLE
+  TRACK
+}
+
+// ---------- Accounts ----------
+
+model User {
+  id                 String              @id @default(nanoid(32)) @db.VarChar(32)
+  role               Role                @default(STUDENT)
+  status             AccountStatus       @default(ACTIVE)
+  fullName           String              @map("full_name") @db.VarChar(120)
+  /// E.164 format. Students sign in with this.
+  phone              String?             @unique @db.VarChar(20)
+  /// Lowercased. Staff sign in with this.
+  email              String?             @unique @db.VarChar(254)
+  country            String?             @db.VarChar(80)
+  /// The value the app collects: "15" to "24", or "25+".
+  ageBand            String?             @map("age_band") @db.VarChar(3)
+  trackId            TrackId?            @map("track_id")
+  trackStart         StabilizationStart? @map("track_start")
+  language           Language            @default(AR)
+  /// The supervision scope of a supervisor or teacher. Students have none.
+  scopeId            String?             @map("scope_id") @db.VarChar(32)
+  section            StudentSection      @default(WOMEN)
+  /// The track a student is on. trackId stays as the app's short name for the original tracks.
+  trackTemplateId    String?             @map("track_template_id") @db.VarChar(32)
+  /// A student's plan begins only once accepted. Staff keep the default.
+  admissionStatus    AdmissionStatus     @default(ACCEPTED) @map("admission_status")
+  admissionScore     Decimal?            @map("admission_score") @db.Decimal(4, 1)
+  admissionNote      String?             @map("admission_note") @db.VarChar(500)
+  admissionDecidedAt DateTime?           @map("admission_decided_at") @db.Timestamptz
+  /// An IANA zone from the student's device. Null falls back to Riyadh.
+  timeZone           String?             @map("time_zone") @db.VarChar(60)
+  /// The daily reminder, in minutes after the student's own midnight.
+  reminderMinutes    Int                 @default(1200) @map("reminder_minutes") @db.SmallInt
+  createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime            @updatedAt @map("updated_at") @db.Timestamptz
+
+  scope              Scope?                   @relation(fields: [scopeId], references: [id], onDelete: SetNull)
+  trackTemplate      TrackTemplate?           @relation(fields: [trackTemplateId], references: [id], onDelete: SetNull)
+  plan               StudentPlan?
+  dayCompletions     DayCompletion[]
+  reflections        TadabburReflection[]
+  gates              SurahGate[]              @relation("GateStudent")
+  gatesDecided       SurahGate[]              @relation("GateDecider")
+  skipRequests       SkipRequest[]            @relation("SkipStudent")
+  skipsDecided       SkipRequest[]            @relation("SkipDecider")
+  gateExceptions     GateException[]          @relation("ExceptionStudent")
+  exceptionsCreated  GateException[]          @relation("ExceptionCreator")
+  stageExams         StageExam[]              @relation("ExamStudent")
+  examsGiven         StageExam[]              @relation("ExamTeacher")
+  practicalsDone     PracticalCompletion[]
+  notifications      Notification[]
+  staffCredential    StaffCredential?
+  staffTokens        StaffSecurityToken[]
+  consents           UserConsent[]
+  refreshTokens      RefreshToken[]
+  notificationPrefs  NotificationPreference[]
+  pushDevices        PushDevice[]
+  taughtCircles      Circle[]                 @relation("CircleTeacher")
+  memberships        CircleMembership[]
+  createdTasks       Task[]                   @relation("TaskCreator")
+  assignedTasks      Task[]                   @relation("TaskStudent")
+  transfers          TransferRequest[]        @relation("TransferStudent")
+  transfersRequested TransferRequest[]        @relation("TransferRequester")
+  taskCompletions    TaskCompletion[]
+  evaluationsGiven   Evaluation[]             @relation("EvaluationTeacher")
+  evaluationsGot     Evaluation[]             @relation("EvaluationStudent")
+  sessionsTaught     LiveSession[]            @relation("SessionTeacher")
+  sessionsAttended   LiveSession[]            @relation("SessionStudent")
+  absenceWarnings    AbsenceWarning[]         @relation("WarningStudent")
+  warningsIssued     AbsenceWarning[]         @relation("WarningIssuer")
+  announcements      Announcement[]
+  badges             StudentBadge[]           @relation("BadgeStudent")
+  badgesAwarded      StudentBadge[]           @relation("BadgeAwarder")
+
+  @@index([role, status])
+  @@index([admissionStatus])
+  @@map("users")
+}
+
+/// Staff only: students have no password. Argon2id hash; TOTP secret encrypted at rest.
+model StaffCredential {
+  userId              String    @id @map("user_id") @db.VarChar(32)
+  /// Null until the staff member sets a password through their setup link.
+  passwordHash        String?   @map("password_hash")
+  totpSecretEncrypted String?   @map("totp_secret_encrypted")
+  totpEnabledAt       DateTime? @map("totp_enabled_at") @db.Timestamptz
+  /// The last accepted code's time step, so a code cannot be used twice.
+  totpLastStep        Int?      @map("totp_last_step")
+  passwordChangedAt   DateTime  @default(now()) @map("password_changed_at") @db.Timestamptz
+  failedAttempts      Int       @default(0) @map("failed_attempts")
+  lockedUntil         DateTime? @map("locked_until") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("staff_credentials")
+}
+
+/// Single-use staff links that set a password. Only the hash is stored.
+model StaffSecurityToken {
+  id         String    @id @default(nanoid(32)) @db.VarChar(32)
+  userId     String    @map("user_id") @db.VarChar(32)
+  tokenHash  String    @unique @map("token_hash")
+  purpose    String    @db.VarChar(30)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+  @@map("staff_security_tokens")
+}
+
+/// Which version of each pledge the student accepted on the privacy screen, and when.
+model UserConsent {
+  id         String      @id @default(nanoid(32)) @db.VarChar(32)
+  userId     String      @map("user_id") @db.VarChar(32)
+  type       ConsentType
+  version    String      @db.VarChar(20)
+  acceptedAt DateTime    @default(now()) @map("accepted_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, type, version])
+  @@map("user_consents")
+}
+
+/// The code is stored as an HMAC. Keyed by phone, not user, so it also covers registration.
+model OtpChallenge {
+  id          String     @id @default(nanoid(32)) @db.VarChar(32)
+  phone       String     @db.VarChar(20)
+  purpose     OtpPurpose
+  codeHmac    String     @map("code_hmac")
+  attempts    Int        @default(0)
+  maxAttempts Int        @default(5) @map("max_attempts")
+  expiresAt   DateTime   @map("expires_at") @db.Timestamptz
+  consumedAt  DateTime?  @map("consumed_at") @db.Timestamptz
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([phone, createdAt])
+  @@index([expiresAt])
+  @@map("otp_challenges")
+}
+
+/// Rotating refresh tokens. Reusing a replaced token revokes its whole family.
+model RefreshToken {
+  id           String        @id @default(nanoid(32)) @db.VarChar(32)
+  userId       String        @map("user_id") @db.VarChar(32)
+  familyId     String        @map("family_id") @db.VarChar(32)
+  tokenHash    String        @unique @map("token_hash")
+  audience     TokenAudience
+  replacedById String?       @unique @map("replaced_by_id") @db.VarChar(32)
+  expiresAt    DateTime      @map("expires_at") @db.Timestamptz
+  revokedAt    DateTime?     @map("revoked_at") @db.Timestamptz
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz
+
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  replacedBy RefreshToken? @relation("Rotation", fields: [replacedById], references: [id], onDelete: SetNull)
+  replaces   RefreshToken? @relation("Rotation")
+
+  @@index([familyId])
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+model NotificationPreference {
+  userId  String           @map("user_id") @db.VarChar(32)
+  type    NotificationType
+  enabled Boolean
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, type])
+  @@map("notification_preferences")
+}
+
+model PushDevice {
+  id         String       @id @default(nanoid(32)) @db.VarChar(32)
+  userId     String       @map("user_id") @db.VarChar(32)
+  pushToken  String       @unique @map("push_token")
+  platform   PushPlatform
+  lastSeenAt DateTime     @default(now()) @map("last_seen_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_devices")
+}
+
+// ---------- Circles ----------
+
+/// A supervisor's area, such as a region. It groups a supervisor's teachers and circles.
+model Scope {
+  id        String   @id @default(nanoid(32)) @db.VarChar(32)
+  name      String   @unique @db.VarChar(80)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  members       User[]
+  circles       Circle[]
+  announcements Announcement[]
+
+  @@map("scopes")
+}
+
+model Circle {
+  id              String    @id @default(nanoid(32)) @db.VarChar(32)
+  name            String    @db.VarChar(80)
+  scopeId         String    @map("scope_id") @db.VarChar(32)
+  capacity        Int       @default(25) @db.SmallInt
+  /// The track this circle presents. Null means no track is set.
+  trackTemplateId String?   @map("track_template_id") @db.VarChar(32)
+  /// The month this circle was last honored, as YYYY-MM.
+  honoredMonth    String?   @map("honored_month") @db.VarChar(7)
+  /// Where the supervisor placed this circle on the distribution board. Null sorts last, oldest first.
+  position        Int?
+  /// RESTRICT: a teacher's circles must be reassigned before the account can be deleted.
+  teacherId       String?   @map("teacher_id") @db.VarChar(32)
+  archivedAt      DateTime? @map("archived_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  teacher       User?              @relation("CircleTeacher", fields: [teacherId], references: [id], onDelete: Restrict)
+  trackTemplate TrackTemplate?     @relation(fields: [trackTemplateId], references: [id], onDelete: SetNull)
+  stageExams    StageExam[]
+  scope         Scope              @relation(fields: [scopeId], references: [id], onDelete: Restrict)
+  memberships   CircleMembership[]
+  tasks         Task[]
+  sessions      LiveSession[]
+  announcements Announcement[]
+  evaluations   Evaluation[]
+  transfersFrom TransferRequest[]  @relation("TransferFrom")
+  transfersTo   TransferRequest[]  @relation("TransferTo")
+
+  @@index([teacherId])
+  @@index([scopeId])
+  @@map("circles")
+}
+
+/// Keeps history. The current circle is the row where leftAt is null.
+model CircleMembership {
+  id        String    @id @default(nanoid(32)) @db.VarChar(32)
+  studentId String    @map("student_id") @db.VarChar(32)
+  circleId  String    @map("circle_id") @db.VarChar(32)
+  joinedAt  DateTime  @default(now()) @map("joined_at") @db.Timestamptz
+  leftAt    DateTime? @map("left_at") @db.Timestamptz
+  /// Where the supervisor placed this student in the circle. Null sorts last, earliest joined first.
+  position  Int?
+
+  student User   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  circle  Circle @relation(fields: [circleId], references: [id], onDelete: Cascade)
+
+  @@index([circleId, leftAt])
+  @@index([studentId])
+  @@map("circle_memberships")
+}
+
+/// Moving a student between circles: the supervisor asks, the administration permits, the new teacher accepts.
+model TransferRequest {
+  id            String         @id @default(nanoid(32)) @db.VarChar(32)
+  studentId     String         @map("student_id") @db.VarChar(32)
+  fromCircleId  String?        @map("from_circle_id") @db.VarChar(32)
+  toCircleId    String         @map("to_circle_id") @db.VarChar(32)
+  status        TransferStatus @default(PENDING_ADMIN)
+  requestedById String?        @map("requested_by_id") @db.VarChar(32)
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+
+  student     User    @relation("TransferStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  fromCircle  Circle? @relation("TransferFrom", fields: [fromCircleId], references: [id], onDelete: SetNull)
+  toCircle    Circle  @relation("TransferTo", fields: [toCircleId], references: [id], onDelete: Cascade)
+  requestedBy User?   @relation("TransferRequester", fields: [requestedById], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([toCircleId, status])
+  @@index([studentId])
+  @@map("transfer_requests")
+}
+
+// ---------- Teaching ----------
+
+model Task {
+  id              String         @id @default(nanoid(32)) @db.VarChar(32)
+  circleId        String         @map("circle_id") @db.VarChar(32)
+  createdById     String?        @map("created_by_id") @db.VarChar(32)
+  /// Set when the task is for one student rather than the whole circle.
+  studentId       String?        @map("student_id") @db.VarChar(32)
+  title           String         @db.VarChar(200)
+  description     String?        @db.VarChar(1000)
+  recurrence      TaskRecurrence
+  /// When a ONCE task is due.
+  dueAt           DateTime?      @map("due_at") @db.Timestamptz
+  /// For a DAILY task: minutes after midnight in Riyadh, for "before 9 pm".
+  deadlineMinutes Int?           @map("deadline_minutes") @db.SmallInt
+  archivedAt      DateTime?      @map("archived_at") @db.Timestamptz
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz
+
+  circle      Circle           @relation(fields: [circleId], references: [id], onDelete: Cascade)
+  createdBy   User?            @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  student     User?            @relation("TaskStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  completions TaskCompletion[]
+
+  @@index([circleId, archivedAt])
+  @@map("tasks")
+}
+
+/// The unique key makes completing a task idempotent, including double taps and races.
+model TaskCompletion {
+  taskId      String   @map("task_id") @db.VarChar(32)
+  studentId   String   @map("student_id") @db.VarChar(32)
+  dueOn       DateTime @map("due_on") @db.Date
+  completedAt DateTime @default(now()) @map("completed_at") @db.Timestamptz
+
+  task    Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  student User @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, studentId, dueOn])
+  @@index([studentId, dueOn])
+  @@map("task_completions")
+}
+
+model Evaluation {
+  id            String            @id @default(nanoid(32)) @db.VarChar(32)
+  studentId     String            @map("student_id") @db.VarChar(32)
+  teacherId     String?           @map("teacher_id") @db.VarChar(32)
+  liveSessionId String?           @map("live_session_id") @db.VarChar(32)
+  /// The circle at the time, so reports stay correct after a transfer.
+  circleId      String?           @map("circle_id") @db.VarChar(32)
+  title         String            @db.VarChar(200)
+  surah         Int?              @db.SmallInt
+  fromAyah      Int?              @map("from_ayah") @db.SmallInt
+  toAyah        Int?              @map("to_ayah") @db.SmallInt
+  /// Null when the student was absent, so nothing was recited.
+  score         Decimal?          @db.Decimal(4, 1)
+  segmentStatus SegmentStatus?    @map("segment_status")
+  attendance    AttendanceStatus?
+  /// Set only on attendance-sheet rows, so each student has one per day.
+  attendanceOn  DateTime?         @map("attendance_on") @db.Date
+  maxScore      Decimal           @default(10) @map("max_score") @db.Decimal(4, 1)
+  comment       String?           @db.VarChar(1000)
+  createdAt     DateTime          @default(now()) @map("created_at") @db.Timestamptz
+
+  student     User            @relation("EvaluationStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  teacher     User?           @relation("EvaluationTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+  liveSession LiveSession?    @relation(fields: [liveSessionId], references: [id], onDelete: SetNull)
+  circle      Circle?         @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  reviews     SegmentReview[]
+
+  @@unique([studentId, attendanceOn])
+  @@index([studentId, createdAt])
+  @@index([circleId, createdAt])
+  @@index([teacherId])
+  @@map("evaluations")
+}
+
+/// A student's own review of a recited segment, which moves its next date further out.
+model SegmentReview {
+  evaluationId String   @map("evaluation_id") @db.VarChar(32)
+  doneOn       DateTime @map("done_on") @db.Date
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  evaluation Evaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@id([evaluationId, doneOn])
+  @@map("segment_reviews")
+}
+
+// ---------- Live sessions ----------
+
+/// Audio only, peer to peer. No audio is recorded, and there is no chat (no message table by design).
+/// A correction session with no student is for the whole circle.
+model LiveSession {
+  id          String            @id @default(nanoid(32)) @db.VarChar(32)
+  circleId    String?           @map("circle_id") @db.VarChar(32)
+  teacherId   String?           @map("teacher_id") @db.VarChar(32)
+  studentId   String?           @map("student_id") @db.VarChar(32)
+  kind        LiveSessionKind   @default(RECITATION)
+  /// The segment to recite, or the correction session's focus.
+  title       String            @db.VarChar(120)
+  /// The teacher's notes after a correction session.
+  notes       String?           @db.VarChar(2000)
+  scheduledAt DateTime          @map("scheduled_at") @db.Timestamptz
+  status      LiveSessionStatus @default(SCHEDULED)
+  attendance  AttendanceStatus?
+  startedAt   DateTime?         @map("started_at") @db.Timestamptz
+  endedAt     DateTime?         @map("ended_at") @db.Timestamptz
+  createdAt   DateTime          @default(now()) @map("created_at") @db.Timestamptz
+
+  circle      Circle?      @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  teacher     User?        @relation("SessionTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+  student     User?        @relation("SessionStudent", fields: [studentId], references: [id], onDelete: SetNull)
+  evaluations Evaluation[]
+
+  @@index([studentId, scheduledAt])
+  @@index([teacherId, scheduledAt])
+  @@index([status, scheduledAt])
+  @@map("live_sessions")
+}
+
+model AbsenceWarning {
+  id         String    @id @default(nanoid(32)) @db.VarChar(32)
+  studentId  String    @map("student_id") @db.VarChar(32)
+  issuedById String?   @map("issued_by_id") @db.VarChar(32)
+  level      Int       @db.SmallInt
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  student  User  @relation("WarningStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  issuedBy User? @relation("WarningIssuer", fields: [issuedById], references: [id], onDelete: SetNull)
+
+  @@index([studentId, resolvedAt])
+  @@map("absence_warnings")
+}
+
+// ---------- Announcements and badges ----------
+
+model Announcement {
+  id              String            @id @default(nanoid(32)) @db.VarChar(32)
+  kind            AnnouncementKind  @default(ANNOUNCEMENT)
+  scope           AnnouncementScope
+  trackTemplateId String?           @map("track_template_id") @db.VarChar(32)
+  /// When it starts and stops showing. A null end means until someone ends it.
+  startsAt        DateTime?         @map("starts_at") @db.Timestamptz
+  endsAt          DateTime?         @map("ends_at") @db.Timestamptz
+  /// How many students an alert reached.
+  recipients      Int?
+  scopeId         String?           @map("scope_id") @db.VarChar(32)
+  circleId        String?           @map("circle_id") @db.VarChar(32)
+  authorId        String?           @map("author_id") @db.VarChar(32)
+  title           String            @db.VarChar(160)
+  body            String            @db.VarChar(2000)
+  publishedAt     DateTime?         @map("published_at") @db.Timestamptz
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz
+
+  targetScope Scope?         @relation(fields: [scopeId], references: [id], onDelete: Cascade)
+  track       TrackTemplate? @relation(fields: [trackTemplateId], references: [id], onDelete: Cascade)
+  circle      Circle?        @relation(fields: [circleId], references: [id], onDelete: Cascade)
+  author      User?          @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([scope, publishedAt])
+  @@index([scopeId, publishedAt])
+  @@index([circleId, publishedAt])
+  @@map("announcements")
+}
+
+model Badge {
+  id        String  @id @default(nanoid(32)) @db.VarChar(32)
+  code      String  @unique @db.VarChar(40)
+  label     String  @db.VarChar(60)
+  condition String? @db.VarChar(200)
+  icon      String  @db.VarChar(40)
+
+  awards StudentBadge[]
+
+  @@map("badges")
+}
+
+model StudentBadge {
+  studentId   String   @map("student_id") @db.VarChar(32)
+  badgeId     String   @map("badge_id") @db.VarChar(32)
+  awardedById String?  @map("awarded_by_id") @db.VarChar(32)
+  awardedAt   DateTime @default(now()) @map("awarded_at") @db.Timestamptz
+
+  student   User  @relation("BadgeStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  badge     Badge @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+  awardedBy User? @relation("BadgeAwarder", fields: [awardedById], references: [id], onDelete: SetNull)
+
+  @@id([studentId, badgeId])
+  @@map("student_badges")
+}
+
+// ---------- Curriculum ----------
+
+/// A track's rules. Each student's plan is computed from these.
+model TrackTemplate {
+  id                String     @id @default(nanoid(32)) @db.VarChar(32)
+  /// Short stable name: the app's track id for the original tracks.
+  code              String     @unique @db.VarChar(40)
+  kind              TrackKind
+  name              String     @db.VarChar(120)
+  audience          String     @db.VarChar(200)
+  duration          String     @db.VarChar(60)
+  active            Boolean    @default(true)
+  gateMode          GateMode   @default(ACTIVE) @map("gate_mode")
+  dailyUnit         DailyUnit? @map("daily_unit")
+  /// Week days with new memorization, Sunday = 0. Other days are for review and rest.
+  wirdDays          Int[]      @map("wird_days")
+  /// Days to consolidate and study tafsir after each surah.
+  consolidationDays Int        @default(1) @map("consolidation_days") @db.SmallInt
+  /// Surah numbers in the order they are memorized.
+  surahOrder        Int[]      @map("surah_order")
+  /// The day's wird, in order. Null means the program's default steps.
+  wirdSteps         Json?      @map("wird_steps")
+  /// How many times today's portion is repeated from memory.
+  repeatTarget      Int        @default(35) @map("repeat_target") @db.SmallInt
+  /// How many times the previous portion is reviewed.
+  reviewTarget      Int        @default(5) @map("review_target") @db.SmallInt
+  /// Words of encouragement shown when a counted step is finished, written by whoever made the track.
+  encouragements    String[]   @default([])
+  focus             String?    @db.VarChar(120)
+  sessionsPerWeek   Int?       @map("sessions_per_week") @db.SmallInt
+  application       String?    @db.VarChar(120)
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz
+
+  students      User[]
+  circles       Circle[]
+  plans         StudentPlan[]
+  announcements Announcement[]
+
+  @@map("track_templates")
+}
+
+/// A student's place in a track. The schedule itself is computed, not stored.
+model StudentPlan {
+  id             String     @id @default(nanoid(32)) @db.VarChar(32)
+  studentId      String     @unique @map("student_id") @db.VarChar(32)
+  templateId     String     @map("template_id") @db.VarChar(32)
+  status         PlanStatus @default(ACTIVE)
+  startOn        DateTime   @map("start_on") @db.Date
+  /// Surah numbers in this student's own order, fixed when the plan starts.
+  surahOrder     Int[]      @map("surah_order")
+  /// How many units are done. The next one to memorize has this index.
+  completedUnits Int        @default(0) @map("completed_units")
+  /// Days spent waiting on a gate, which don't count as falling behind.
+  creditedDays   Int        @default(0) @map("credited_days")
+  /// When the student finished the track. The date on the certificate.
+  completedAt    DateTime?  @map("completed_at") @db.Timestamptz
+  createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime   @updatedAt @map("updated_at") @db.Timestamptz
+
+  student  User           @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  template TrackTemplate  @relation(fields: [templateId], references: [id], onDelete: Restrict)
+  logs     WirdLog[]
+  progress WirdProgress[]
+
+  @@index([templateId])
+  @@map("student_plans")
+}
+
+/// One row per unit done. The unique key means a double tap can't count twice.
+model WirdLog {
+  planId    String     @map("plan_id") @db.VarChar(32)
+  unitIndex Int        @map("unit_index")
+  source    WirdSource
+  doneOn    DateTime   @map("done_on") @db.Date
+  createdAt DateTime   @default(now()) @map("created_at") @db.Timestamptz
+
+  plan StudentPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@id([planId, unitIndex])
+  @@index([planId, doneOn])
+  @@map("wird_logs")
+}
+
+/// A unit's daily steps while the student works through it, so they carry across devices.
+model WirdProgress {
+  planId      String   @map("plan_id") @db.VarChar(32)
+  unitIndex   Int      @map("unit_index")
+  /// Ids of the steps finished by their own button. The counted steps go by the counts below.
+  doneSteps   Int[]    @map("done_steps")
+  repeatCount Int      @default(0) @map("repeat_count") @db.SmallInt
+  reviewCount Int      @default(0) @map("review_count") @db.SmallInt
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  plan StudentPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@id([planId, unitIndex])
+  @@map("wird_progress")
+}
+
+/// A review, wrap or consolidation day the student marked done. Once per kind per day.
+model DayCompletion {
+  studentId String      @map("student_id") @db.VarChar(32)
+  doneOn    DateTime    @map("done_on") @db.Date
+  kind      DayTaskKind
+  /// For a weekly review: the surahs the student wrote.
+  detail    String?     @db.VarChar(300)
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz
+
+  student User @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@id([studentId, doneOn, kind])
+  @@map("day_completions")
+}
+
+/// What a student took from a surah's lesson, sent to the teacher with the practical tasks.
+model TadabburReflection {
+  studentId String   @map("student_id") @db.VarChar(32)
+  surah     Int      @db.SmallInt
+  body      String   @db.VarChar(4000)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  student User @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@id([studentId, surah])
+  @@map("tadabbur_reflections")
+}
+
+/// What stands between finishing a surah and starting the next.
+model SurahGate {
+  id                String     @id @default(nanoid(32)) @db.VarChar(32)
+  studentId         String     @map("student_id") @db.VarChar(32)
+  surah             Int        @db.SmallInt
+  status            GateStatus @default(PENDING)
+  openedOn          DateTime   @map("opened_on") @db.Date
+  testDueOn         DateTime   @map("test_due_on") @db.Date
+  tafsirDoneAt      DateTime?  @map("tafsir_done_at") @db.Timestamptz
+  lessonAttendedAt  DateTime?  @map("lesson_attended_at") @db.Timestamptz
+  /// The teacher's confirmation of what the student declared.
+  lessonConfirmedAt DateTime?  @map("lesson_confirmed_at") @db.Timestamptz
+  wrapCount         Int        @default(0) @map("wrap_count") @db.SmallInt
+  score             Decimal?   @db.Decimal(4, 1)
+  returnNote        String?    @map("return_note") @db.VarChar(500)
+  decidedById       String?    @map("decided_by_id") @db.VarChar(32)
+  decidedAt         DateTime?  @map("decided_at") @db.Timestamptz
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz
+
+  student   User  @relation("GateStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  decidedBy User? @relation("GateDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+
+  @@unique([studentId, surah])
+  @@index([status])
+  @@map("surah_gates")
+}
+
+model SkipRequest {
+  id          String     @id @default(nanoid(32)) @db.VarChar(32)
+  studentId   String     @map("student_id") @db.VarChar(32)
+  /// The surah to skip. Null for a request about something else, such as moving to another stage.
+  surah       Int?       @db.SmallInt
+  request     String     @db.VarChar(200)
+  reason      String     @db.VarChar(500)
+  status      SkipStatus @default(PENDING)
+  decidedById String?    @map("decided_by_id") @db.VarChar(32)
+  decidedAt   DateTime?  @map("decided_at") @db.Timestamptz
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz
+
+  student   User  @relation("SkipStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  decidedBy User? @relation("SkipDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+
+  @@index([studentId, status])
+  @@map("skip_requests")
+}
+
+model GateException {
+  id          String            @id @default(nanoid(32)) @db.VarChar(32)
+  studentId   String            @map("student_id") @db.VarChar(32)
+  type        GateExceptionType
+  reason      String            @db.VarChar(300)
+  /// Null means permanent.
+  expiresAt   DateTime?         @map("expires_at") @db.Timestamptz
+  createdById String?           @map("created_by_id") @db.VarChar(32)
+  createdAt   DateTime          @default(now()) @map("created_at") @db.Timestamptz
+
+  student   User  @relation("ExceptionStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  createdBy User? @relation("ExceptionCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([studentId])
+  @@map("gate_exceptions")
+}
+
+model StageExam {
+  id        String   @id @default(nanoid(32)) @db.VarChar(32)
+  studentId String   @map("student_id") @db.VarChar(32)
+  teacherId String?  @map("teacher_id") @db.VarChar(32)
+  circleId  String?  @map("circle_id") @db.VarChar(32)
+  stage     Int      @db.SmallInt
+  score     Decimal  @db.Decimal(4, 1)
+  passed    Boolean
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  student User    @relation("ExamStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  teacher User?   @relation("ExamTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+  circle  Circle? @relation(fields: [circleId], references: [id], onDelete: SetNull)
+
+  @@index([circleId, stage])
+  @@index([studentId, stage])
+  @@map("stage_exams")
+}
+
+// ---------- Content ----------
+
+/// What follows a surah: the lesson, then the practical tasks.
+model SurahTadabbur {
+  surah      Int      @id @db.SmallInt
+  lessonType String   @map("lesson_type") @db.VarChar(40)
+  sheikh     String   @db.VarChar(120)
+  schedule   String   @db.VarChar(80)
+  link       String?  @db.VarChar(500)
+  journaling Boolean  @default(true)
+  published  Boolean  @default(false)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  tasks TadabburTask[]
+
+  @@map("surah_tadabbur")
+}
+
+model TadabburTask {
+  id       String @id @default(nanoid(32)) @db.VarChar(32)
+  surah    Int    @db.SmallInt
+  title    String @db.VarChar(160)
+  note     String @db.VarChar(300)
+  position Int    @default(0) @db.SmallInt
+
+  content     SurahTadabbur         @relation(fields: [surah], references: [surah], onDelete: Cascade)
+  completions PracticalCompletion[]
+
+  @@index([surah, position])
+  @@map("tadabbur_tasks")
+}
+
+model PracticalCompletion {
+  taskId    String   @map("task_id") @db.VarChar(32)
+  studentId String   @map("student_id") @db.VarChar(32)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  task    TadabburTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  student User         @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, studentId])
+  @@index([studentId])
+  @@map("practical_completions")
+}
+
+model Translation {
+  id        String            @id @default(nanoid(32)) @db.VarChar(32)
+  language  String            @db.VarChar(40)
+  source    String            @db.VarChar(160)
+  fileName  String            @map("file_name") @db.VarChar(200)
+  status    TranslationStatus @default(REVIEW)
+  createdAt DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime          @updatedAt @map("updated_at") @db.Timestamptz
+
+  verses TranslationVerse[]
+
+  @@index([language, status])
+  @@map("translations")
+}
+
+model TranslationVerse {
+  translationId String @map("translation_id") @db.VarChar(32)
+  surah         Int    @db.SmallInt
+  ayah          Int    @db.SmallInt
+  text          String
+
+  translation Translation @relation(fields: [translationId], references: [id], onDelete: Cascade)
+
+  @@id([translationId, surah, ayah])
+  @@map("translation_verses")
+}
+
+/// A language's interface text for the app, replaced as a whole on upload.
+model LanguagePack {
+  code      String   @id @db.VarChar(5)
+  content   Json
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("language_packs")
+}
+
+/// Settings changed without updating the app. Each key's shape is checked in SettingsService.
+model AppSetting {
+  key       String   @id @db.VarChar(40)
+  value     Json
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("app_settings")
+}
+
+model InfoPage {
+  slug      String   @id @db.VarChar(40)
+  title     String   @db.VarChar(160)
+  body      String   @db.VarChar(20000)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("info_pages")
+}
+
+model EncouragementMessage {
+  id        String   @id @default(nanoid(32)) @db.VarChar(32)
+  text      String   @unique @db.VarChar(160)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@map("encouragement_messages")
+}
+
+/// What a student sees in the app's notifications. Push delivery can be added on top of this.
+model Notification {
+  id        String           @id @default(nanoid(32)) @db.VarChar(32)
+  userId    String           @map("user_id") @db.VarChar(32)
+  type      NotificationType
+  title     String           @db.VarChar(160)
+  body      String           @db.VarChar(2000)
+  /// Stops a repeat, such as a second reminder to the same student on the same day.
+  dedupeKey String?          @map("dedupe_key") @db.VarChar(120)
+  readAt    DateTime?        @map("read_at") @db.Timestamptz
+  createdAt DateTime         @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// ---------- Audit ----------
+
+/// Append-only record of staff and security actions. actorId has no foreign key, so it survives
+/// account deletion. Never store OTP codes, tokens, or passwords in metadata.
+model AuditLog {
+  id         String   @id @default(nanoid(32)) @db.VarChar(32)
+  actorId    String?  @map("actor_id") @db.VarChar(32)
+  actorRole  Role?    @map("actor_role")
+  action     String   @db.VarChar(80)
+  targetType String?  @map("target_type") @db.VarChar(40)
+  targetId   String?  @map("target_id") @db.VarChar(32)
+  metadata   Json?
+  requestId  String?  @map("request_id") @db.VarChar(64)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([actorId, createdAt])
+  @@index([targetType, targetId])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
