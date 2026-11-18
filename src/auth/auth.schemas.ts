@@ -66,7 +66,7 @@ export type RequestOtpDto = z.infer<typeof requestOtpSchema>;
 
 export const verifyOtpSchema = z.strictObject({
   phone: phoneSchema,
-  code: z.string().regex(/^\d{6}$/),
+  code: z.string().regex(/^\d{4}$/),
   registration: registrationSchema.optional(),
 });
 export type VerifyOtpDto = z.infer<typeof verifyOtpSchema>;

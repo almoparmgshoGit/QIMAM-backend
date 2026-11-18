@@ -9,6 +9,7 @@ export class PrismaService extends PrismaClient implements OnModuleDestroy {
     const schema = config.get<string>('DATABASE_SCHEMA');
     super({
       adapter: new PrismaPg({ connectionString: config.getOrThrow<string>('DATABASE_URL') }, schema ? { schema } : undefined),
+      transactionOptions: { maxWait: 10_000 },
     });
   }
 
