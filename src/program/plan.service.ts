@@ -12,17 +12,28 @@ import {
   buildWeek,
   computeProgress,
   convertCompletedUnits,
+  type DailyAmount,
   DAY_MS,
   delayLabel,
+  dueUnitsToday,
   firstOpenStep,
+  type SessionEvent,
+  sessionEventFinishes,
+  sessionsOf,
+  stepOptions,
   type PlanProgress,
   type PlanRules,
   type PlanUnit,
   unitLabel,
   wirdConfigOf,
+  wirdCountsOf,
 } from './plan-engine.js';
+import { type BadgeMetrics, badgeReached, EMPTY_METRICS } from './badge-rules.js';
+import { reviewEndsOnFor } from './review-rules.js';
+import { pageRangeFor } from './scope.js';
 import { NotificationsService } from './notifications.service.js';
 import { SettingsService, type SettingValue } from './settings.service.js';
+import { StageExamService } from './stage-exam.service.js';
 
 export type StudentPlanStatus = 'no_plan' | 'regular' | 'late' | 'awaiting_gate' | 'completed';
 
@@ -76,26 +87,57 @@ export class PlanService {
     private readonly settings: SettingsService,
     private readonly audit: AuditService,
     private readonly notifications: NotificationsService,
+    private readonly stageExams: StageExamService,
   ) {}
 
   /** Starts a student's plan on their track, once accepted, if they have a memorization track and no plan yet. */
   async startPlan(studentId: string): Promise<void> {
     const student = await this.prisma.user.findUnique({
       where: { id: studentId },
-      select: { admissionStatus: true, trackStart: true, trackTemplate: { select: { id: true, kind: true, surahOrder: true } } },
+      select: {
+        admissionStatus: true,
+        trackStart: true,
+        trackTemplate: { select: { id: true, kind: true, surahOrder: true, juzFrom: true, juzTo: true, durationMonths: true } },
+      },
     });
     const template = student?.trackTemplate;
-    if (student?.admissionStatus !== 'ACCEPTED' || template?.kind !== 'MEMORIZATION') return;
+    // A review track runs a plan as memorization does. A correction track has none.
+    if (student?.admissionStatus !== 'ACCEPTED' || !template || template.kind === 'CORRECTION') return;
 
-    // On the stabilization track a student may choose to begin at Al-Fatiha instead of Al-Kahf.
+    // On the stabilization track a student chooses to begin at Al-Kahf or at Al-Fatiha. The plan goes round from there
+    // in the track's own order. A surah outside the track's scope leaves the plan at the track's own start.
     const order = template.surahOrder;
-    const from = student?.trackStart === 'FATIHA' ? Math.max(order.indexOf(1), 0) : 0;
+    const startSurah = student?.trackStart === 'KAHF' ? 18 : student?.trackStart === 'FATIHA' ? 1 : null;
+    const from = startSurah === null ? 0 : Math.max(order.indexOf(startSurah), 0);
     const surahOrder = [...order.slice(from), ...order.slice(0, from)];
 
+    const startOn = riyadhDate();
     await this.prisma.studentPlan.createMany({
-      data: [{ studentId, templateId: template.id, startOn: riyadhDate(), surahOrder }],
+      data: [
+        {
+          studentId,
+          templateId: template.id,
+          startOn,
+          surahOrder,
+          pageRange: pageRangeFor(template.juzFrom, template.juzTo),
+          reviewEndsOn: template.kind === 'REVIEW' ? reviewEndsOnFor(startOn, template.durationMonths) : null,
+        },
+      ],
       skipDuplicates: true,
     });
+  }
+
+  /**
+   * A new track or starting point begins the plan again: the old plan, its logs and any gate still waiting go.
+   * With `startNow` the new plan begins at once; otherwise it begins when the student joins a circle.
+   */
+  async restartPlan(studentId: string, startNow: boolean): Promise<void> {
+    await this.prisma.$transaction([
+      // The logs and daily progress go with the plan.
+      this.prisma.studentPlan.deleteMany({ where: { studentId } }),
+      this.prisma.surahGate.deleteMany({ where: { studentId, status: 'PENDING' } }),
+    ]);
+    if (startNow) await this.startPlan(studentId);
   }
 
   /** Each student's standing, computed together so a list of any size runs a fixed number of queries. */
@@ -106,7 +148,7 @@ export class PlanService {
     const [plans, pending, passed] = await Promise.all([
       this.prisma.studentPlan.findMany({
         where: { studentId: { in: studentIds } },
-        include: { template: { select: { dailyUnit: true, wirdDays: true, consolidationDays: true } } },
+        include: { template: { select: { dailyUnit: true, dailyAyahs: true, wirdDays: true, consolidationDays: true } } },
       }),
       this.prisma.surahGate.findMany({
         where: { studentId: { in: studentIds }, status: 'PENDING' },
@@ -125,7 +167,7 @@ export class PlanService {
     for (const plan of plans) {
       const rules = this.rulesOf(plan.template);
       if (!rules) continue;
-      const units = this.unitsOf(rules.dailyUnit, plan.surahOrder);
+      const units = this.unitsOf(rules, plan);
       const gate = pendingBy.get(plan.studentId);
       const position = {
         startOn: plan.startOn,
@@ -156,7 +198,7 @@ export class PlanService {
   async weekFor(studentId: string) {
     const plan = await this.prisma.studentPlan.findUnique({
       where: { studentId },
-      include: { template: { select: { name: true, dailyUnit: true, wirdDays: true, consolidationDays: true } } },
+      include: { template: { select: { name: true, dailyUnit: true, dailyAyahs: true, wirdDays: true, consolidationDays: true } } },
     });
     const rules = plan && this.rulesOf(plan.template);
     if (!plan || !rules) return null;
@@ -167,7 +209,7 @@ export class PlanService {
       where: { planId: plan.id, doneOn: { gte: plusDays(today, -7) } },
       select: { doneOn: true },
     });
-    const units = this.unitsOf(rules.dailyUnit, plan.surahOrder);
+    const units = this.unitsOf(rules, plan);
     return {
       trackName: plan.template.name,
       startOn: plan.startOn,
@@ -181,19 +223,85 @@ export class PlanService {
     };
   }
 
+  /**
+   * The unit the student finished herself today once today's wird is done, or null while it isn't. The wird is
+   * daily, and a missed wird day carries over: today's wird is every portion due up to today, so the day is done
+   * only once she has caught up. With nothing owed she may still do one portion ahead, and the next opens tomorrow.
+   * A teacher's recitation or an approved skip doesn't use up her day, though it does count toward what is owed.
+   */
+  async ownWirdToday(planId: string): Promise<number | null> {
+    return (await this.todayWird(planId)).doneUnit;
+  }
+
+  /** Today's wird: how many portions it holds, how many are done, and the last one she finished once it is done. */
+  async todayWird(planId: string): Promise<{ doneUnit: number | null; total: number; done: number }> {
+    const today = riyadhDate();
+    const [plan, logs] = await Promise.all([
+      this.prisma.studentPlan.findUnique({
+        where: { id: planId },
+        include: { template: { select: { dailyUnit: true, dailyAyahs: true, wirdDays: true, consolidationDays: true } } },
+      }),
+      this.prisma.wirdLog.findMany({ where: { planId, doneOn: today }, orderBy: { unitIndex: 'desc' }, select: { unitIndex: true, source: true } }),
+    ]);
+    const rules = plan && this.rulesOf(plan.template);
+    const own = logs.find(({ source }) => source === 'STUDENT');
+    if (!plan || !rules) return { doneUnit: own?.unitIndex ?? null, total: logs.length, done: logs.length };
+
+    const gate = await this.prisma.surahGate.findFirst({ where: { studentId: plan.studentId, status: 'PENDING' }, select: { openedOn: true } });
+    const units = this.unitsOf(rules, plan);
+    const due = dueUnitsToday(
+      units,
+      rules,
+      { startOn: plan.startOn, completedUnits: plan.completedUnits, creditedDays: plan.creditedDays, gateOpenedOn: gate?.openedOn ?? null },
+      today,
+    );
+    const owed = Math.max(0, due - plan.completedUnits);
+    const finished = plan.status === 'COMPLETED' || (own !== undefined && owed === 0);
+    // Nothing owed and nothing done yet still leaves one portion to do today.
+    const remaining = finished ? 0 : Math.max(1, owed);
+    return { doneUnit: finished ? (own?.unitIndex ?? null) : null, total: logs.length + remaining, done: logs.length };
+  }
+
+  /**
+   * Ticks the wird's session step for the portion the student is working on, when what the teacher did is
+   * what the track asks of it: the voice session ending, or the recitation evaluated (or marked mastered),
+   * heard the way the track recites. Nothing changes once today's wird is done, since the next portion hasn't
+   * been started yet.
+   */
+  async markSessionStep(studentId: string, event: SessionEvent): Promise<void> {
+    const plan = await this.prisma.studentPlan.findUnique({
+      where: { studentId },
+      select: { id: true, status: true, completedUnits: true, template: { select: { wirdSteps: true, recitationMode: true, repeatTarget: true, reviewTarget: true, listenTarget: true } } },
+    });
+    if (!plan || plan.status !== 'ACTIVE') return;
+    const config = wirdConfigOf(plan.template);
+    const step = config.steps.find(({ kind }) => kind === 'SESSION');
+    if (!step || !sessionEventFinishes(stepOptions(step).completion, event, config.recitationMode)) return;
+    if ((await this.ownWirdToday(plan.id)) !== null) return;
+
+    const key = { planId: plan.id, unitIndex: plan.completedUnits };
+    const row = await this.prisma.wirdProgress.findUnique({ where: { planId_unitIndex: key }, select: { doneSteps: true } });
+    if (row?.doneSteps.includes(step.id)) return;
+    await this.prisma.wirdProgress.upsert({
+      where: { planId_unitIndex: key },
+      create: { ...key, doneSteps: [step.id] },
+      update: { doneSteps: { push: step.id } },
+    });
+  }
+
   /** Marks the next unit done. Refuses to pass a gate, or to count the same unit twice. */
   async completeNextUnit(studentId: string, source: WirdSource): Promise<void> {
     const plan = await this.prisma.studentPlan.findUnique({
       where: { studentId },
       include: {
-        template: { select: { gateMode: true, dailyUnit: true, wirdDays: true, consolidationDays: true, wirdSteps: true, repeatTarget: true, reviewTarget: true } },
+        template: { select: { gateMode: true, stageExamMode: true, dailyUnit: true, dailyAyahs: true, dailySessions: true, wirdDays: true, consolidationDays: true, wirdSteps: true, recitationMode: true, repeatTarget: true, reviewTarget: true, listenTarget: true } },
       },
     });
     const rules = plan && this.rulesOf(plan.template);
     if (!plan || !rules) throw new ApiError(404, 'no_plan');
     if (plan.status === 'COMPLETED') throw new ApiError(409, 'plan_completed');
 
-    const units = this.unitsOf(rules.dailyUnit, plan.surahOrder);
+    const units = this.unitsOf(rules, plan);
     const index = plan.completedUnits;
     const unit = units[index];
     if (index > 0 && units[index - 1].lastOfSurah) {
@@ -203,14 +311,20 @@ export class PlanService {
       });
       if (gate?.status === 'PENDING') throw new ApiError(409, 'gate_pending');
     }
+    // A track may hold new memorization until the last seventh finished is tested.
+    if (await this.stageExams.holdsBack(studentId, plan.template.stageExamMode)) throw new ApiError(409, 'stage_exam_pending');
     // A teacher's recitation or an approved skip stands on its own. A student's own wird needs every step.
     if (source === 'STUDENT') {
+      if ((await this.ownWirdToday(plan.id)) !== null) throw new ApiError(409, 'wird_done_today');
       const progress = await this.prisma.wirdProgress.findUnique({
         where: { planId_unitIndex: { planId: plan.id, unitIndex: index } },
-        select: { doneSteps: true, repeatCount: true, reviewCount: true },
+        select: { doneSteps: true, repeatCount: true, reviewCount: true, listenCount: true, doneSessions: true },
       });
-      const counts = { doneSteps: progress?.doneSteps ?? [], repeatCount: progress?.repeatCount ?? 0, reviewCount: progress?.reviewCount ?? 0 };
+      const counts = wirdCountsOf(progress);
       if (firstOpenStep(counts, wirdConfigOf(plan.template), index > 0)) throw new ApiError(409, 'wird_steps_incomplete');
+      // A day split into sessions is done once every session is.
+      const sessions = sessionsOf(unit, plan.template.dailySessions);
+      if (sessions.some(({ number }) => !progress?.doneSessions.includes(number))) throw new ApiError(409, 'wird_sessions_incomplete');
     }
 
     const today = riyadhDate();
@@ -237,11 +351,12 @@ export class PlanService {
       await this.notifications.notifyTeacherOf(studentId, {
         type: 'GENERAL',
         title: 'بوابة بانتظار الاعتماد',
-        body: `أتمّت طالبة سورة ${findSurah(unit.surah)?.name ?? unit.surah}.`,
+        body: `{{أتمّ طالب|أتمّت طالبة}} سورة ${findSurah(unit.surah)?.name ?? unit.surah}.`,
         dedupeKey: `gate-ready:${studentId}:${unit.surah}`,
       });
     }
-    if (index + 1 === units.length) await this.awardBadge(studentId, 'quranCompanion');
+    await this.stageExams.onProgress(studentId, units, index, index + 1, plan.template.stageExamMode);
+    await this.awardEarnedBadges(studentId);
   }
 
   /** A teacher's recitation counts as the work when it covers what comes next, and only then. */
@@ -249,12 +364,12 @@ export class PlanService {
     for (;;) {
       const plan = await this.prisma.studentPlan.findUnique({
         where: { studentId },
-        include: { template: { select: { dailyUnit: true, wirdDays: true, consolidationDays: true } } },
+        include: { template: { select: { dailyUnit: true, dailyAyahs: true, wirdDays: true, consolidationDays: true } } },
       });
       const rules = plan && this.rulesOf(plan.template);
       if (!plan || !rules || plan.status !== 'ACTIVE') return;
 
-      const next = this.unitsOf(rules.dailyUnit, plan.surahOrder)[plan.completedUnits];
+      const next = this.unitsOf(rules, plan)[plan.completedUnits];
       if (next?.surah !== surah || next.fromAyah < fromAyah || next.toAyah > toAyah) return;
 
       try {
@@ -324,7 +439,7 @@ export class PlanService {
       if (score < described.exam.passScore) throw new ApiError(409, 'score_below_pass');
     }
     await this.closeGate(gate, 'PASSED', actor, score);
-    await this.awardBadge(gate.studentId, 'surahComplete');
+    await this.awardEarnedBadges(gate.studentId);
     await this.audit.record(actor, 'gate.approve', { type: 'student', id: gate.studentId }, { surah: gate.surah, score });
   }
 
@@ -343,12 +458,12 @@ export class PlanService {
   async skipCurrentSurah(actor: StaffActor, studentId: string, surah: number): Promise<void> {
     const plan = await this.prisma.studentPlan.findUnique({
       where: { studentId },
-      include: { template: { select: { dailyUnit: true, wirdDays: true, consolidationDays: true } } },
+      include: { template: { select: { dailyUnit: true, dailyAyahs: true, wirdDays: true, consolidationDays: true, stageExamMode: true } } },
     });
     const rules = plan && this.rulesOf(plan.template);
     if (!plan || !rules) throw new ApiError(404, 'no_plan');
 
-    const units = this.unitsOf(rules.dailyUnit, plan.surahOrder);
+    const units = this.unitsOf(rules, plan);
     const remaining = units.slice(plan.completedUnits).filter((unit) => unit.surah === surah);
     const today = riyadhDate();
 
@@ -370,6 +485,8 @@ export class PlanService {
           update: { status: 'SKIPPED', decidedById: actor.id, decidedAt: new Date() },
         });
       });
+      // A skipped surah still finishes its seventh, which is tested like any other.
+      await this.stageExams.onProgress(studentId, units, plan.completedUnits, end, plan.template.stageExamMode);
       return;
     }
 
@@ -377,6 +494,52 @@ export class PlanService {
     const gate = await this.prisma.surahGate.findUnique({ where: { studentId_surah: { studentId, surah } } });
     if (gate?.status !== 'PENDING') throw new ApiError(409, 'not_current_surah');
     await this.closeGate(gate, 'SKIPPED', actor, null);
+  }
+
+  /** The surahs a teacher can send the student back to: those begun before where the student is now. */
+  async rewindableSurahs(studentId: string): Promise<number[]> {
+    const plan = await this.prisma.studentPlan.findUnique({
+      where: { studentId },
+      include: { template: { select: { dailyUnit: true, dailyAyahs: true, wirdDays: true, consolidationDays: true } } },
+    });
+    const rules = plan && this.rulesOf(plan.template);
+    if (!plan || !rules) return [];
+    return [...new Set(this.unitsOf(rules, plan).slice(0, plan.completedUnits).map(({ surah }) => surah))];
+  }
+
+  /**
+   * Sends the student back to the start of a surah already memorized, to memorize it and what follows again.
+   * The work from there on is undone, with its gates. The days it took are credited, so going back is the
+   * teacher's decision and doesn't show as the student falling behind.
+   */
+  async rewindToSurah(actor: StaffActor, studentId: string, surah: number): Promise<void> {
+    const plan = await this.prisma.studentPlan.findUnique({
+      where: { studentId },
+      include: { template: { select: { dailyUnit: true, dailyAyahs: true, wirdDays: true, consolidationDays: true } } },
+    });
+    const rules = plan && this.rulesOf(plan.template);
+    if (!plan || !rules) throw new ApiError(404, 'no_plan');
+
+    const units = this.unitsOf(rules, plan);
+    const from = units.findIndex((unit) => unit.surah === surah);
+    if (from === -1 || from >= plan.completedUnits) throw new ApiError(409, 'not_before_current');
+
+    const undone = units.slice(from, plan.completedUnits);
+    const surahs = [...new Set(undone.map((unit) => unit.surah))];
+    // Each unit is a wird day, and the week has only its wird days, so this many calendar days cover them.
+    const credit = Math.ceil((undone.length * 7) / Math.max(1, rules.wirdDays.length));
+
+    await this.prisma.$transaction(async (tx) => {
+      const moved = await tx.studentPlan.updateMany({
+        where: { id: plan.id, completedUnits: plan.completedUnits },
+        data: { completedUnits: from, status: 'ACTIVE', completedAt: null, creditedDays: { increment: credit } },
+      });
+      if (moved.count !== 1) throw new ApiError(409, 'already_done');
+      await tx.wirdLog.deleteMany({ where: { planId: plan.id, unitIndex: { gte: from } } });
+      await tx.wirdProgress.deleteMany({ where: { planId: plan.id, unitIndex: { gte: from } } });
+      await tx.surahGate.deleteMany({ where: { studentId, surah: { in: surahs } } });
+    });
+    await this.audit.record(actor, 'plan.rewind', { type: 'student', id: studentId }, { surah, units: undone.length });
   }
 
   private async closeGate(gate: GateRow, status: 'PASSED' | 'SKIPPED', actor: StaffActor, score: number | null): Promise<void> {
@@ -396,7 +559,7 @@ export class PlanService {
    * A new daily amount applies to everyone on the track. Each plan keeps exactly what was memorized, recounted
    * in the new units. Steps in progress belong to a unit, so they start over.
    */
-  async changeDailyUnit(templateId: string, from: DailyUnit, to: DailyUnit, tx: Prisma.TransactionClient): Promise<void> {
+  async changeDailyUnit(templateId: string, from: DailyAmount, to: DailyAmount, tx: Prisma.TransactionClient): Promise<void> {
     const plans = await tx.studentPlan.findMany({
       where: { templateId },
       select: {
@@ -404,12 +567,13 @@ export class PlanService {
         completedUnits: true,
         completedAt: true,
         surahOrder: true,
+        pageRange: true,
         logs: { orderBy: { createdAt: 'asc' }, select: { unitIndex: true, source: true, doneOn: true, createdAt: true } },
       },
     });
     for (const plan of plans) {
-      const before = this.unitsOf(from, plan.surahOrder);
-      const after = this.unitsOf(to, plan.surahOrder);
+      const before = this.unitsOf(from, plan);
+      const after = this.unitsOf(to, plan);
       const logs = new Map<number, (typeof plan.logs)[number]>();
       for (const log of plan.logs) {
         const unitIndex = convertCompletedUnits(before, after, log.unitIndex + 1) - 1;
@@ -434,13 +598,48 @@ export class PlanService {
     }
   }
 
-  async awardBadge(studentId: string, code: string, awardedById?: string): Promise<void> {
-    const badge = await this.prisma.badge.findUnique({ where: { code }, select: { id: true } });
-    if (!badge) return;
-    await this.prisma.studentBadge.createMany({
-      data: [{ studentId, badgeId: badge.id, awardedById }],
-      skipDuplicates: true,
+  /** What automatic badges count for this student. */
+  async badgeMetrics(studentId: string): Promise<BadgeMetrics> {
+    const [plan, surahsPassed] = await Promise.all([
+      this.prisma.studentPlan.findUnique({
+        where: { studentId },
+        include: { template: { select: { dailyUnit: true, dailyAyahs: true, wirdDays: true, consolidationDays: true } } },
+      }),
+      this.prisma.surahGate.count({ where: { studentId, status: 'PASSED' } }),
+    ]);
+    const rules = plan && this.rulesOf(plan.template);
+    if (!plan || !rules) return { ...EMPTY_METRICS, surahsPassed };
+
+    const units = this.unitsOf(rules, plan);
+    const logs = await this.prisma.wirdLog.findMany({
+      where: { planId: plan.id, source: { not: 'SKIP' } },
+      select: { unitIndex: true, doneOn: true },
     });
+    return {
+      surahsPassed,
+      pages: logs.reduce((sum, { unitIndex }) => sum + (units[unitIndex]?.pages ?? 0), 0),
+      wirdDays: new Set(logs.map(({ doneOn }) => doneOn.toISOString().slice(0, 10))).size,
+      trackProgress: units.length > 0 ? Math.round((plan.completedUnits / units.length) * 100) : 0,
+      trackCompleted: plan.status === 'COMPLETED',
+    };
+  }
+
+  /** Gives the student every active automatic badge she has now reached, and tells her about each. */
+  async awardEarnedBadges(studentId: string): Promise<void> {
+    const candidates = await this.prisma.badge.findMany({
+      where: { active: true, trigger: { not: 'MANUAL' }, audience: { in: ['STUDENTS', 'EVERYONE'] }, awards: { none: { studentId } } },
+      select: { id: true, label: true, trigger: true, threshold: true },
+    });
+    if (candidates.length === 0) return;
+
+    const metrics = await this.badgeMetrics(studentId);
+    for (const badge of candidates) {
+      if (!badgeReached(badge.trigger, badge.threshold, metrics)) continue;
+      const { count } = await this.prisma.studentBadge.createMany({ data: [{ studentId, badgeId: badge.id }], skipDuplicates: true });
+      if (count === 1) {
+        await this.notifications.send([studentId], { type: 'BADGES', title: 'شارة جديدة', body: badge.label, dedupeKey: `badge:${badge.id}` });
+      }
+    }
   }
 
   private describeGate(gate: GateRow, context: GateContext) {
@@ -491,17 +690,17 @@ export class PlanService {
     };
   }
 
-  private rulesOf(template: { dailyUnit: DailyUnit | null; wirdDays: number[]; consolidationDays: number }): PlanRules | null {
+  private rulesOf(template: { dailyUnit: DailyUnit | null; dailyAyahs: number | null; wirdDays: number[]; consolidationDays: number }): PlanRules | null {
     return template.dailyUnit
-      ? { dailyUnit: template.dailyUnit, wirdDays: template.wirdDays, consolidationDays: template.consolidationDays }
+      ? { dailyUnit: template.dailyUnit, dailyAyahs: template.dailyAyahs, wirdDays: template.wirdDays, consolidationDays: template.consolidationDays }
       : null;
   }
 
-  private unitsOf(dailyUnit: DailyUnit, surahOrder: number[]): PlanUnit[] {
-    const key = `${dailyUnit}:${surahOrder.join(',')}`;
+  private unitsOf({ dailyUnit, dailyAyahs }: DailyAmount, { surahOrder, pageRange }: { surahOrder: number[]; pageRange: number[] }): PlanUnit[] {
+    const key = `${dailyUnit}:${dailyAyahs ?? ''}:${surahOrder.join(',')}:${pageRange.join('-')}`;
     let units = this.unitCache.get(key);
     if (!units) {
-      units = buildUnits(dailyUnit, surahOrder);
+      units = buildUnits(dailyUnit, surahOrder, pageRange, dailyAyahs);
       this.unitCache.set(key, units);
     }
     return units;

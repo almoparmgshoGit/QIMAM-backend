@@ -1,7 +1,8 @@
-import { Body, Controller, Get, HttpCode, Post, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Req, Res } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { ApiError } from '../common/api-error.js';
+import { idSchema } from '../common/staff-api.js';
 import { Public } from './public.decorator.js';
 import { clearStaffCookies, setStaffCookies, STAFF_REFRESH_COOKIE } from './staff-cookies.js';
 import {
@@ -9,6 +10,8 @@ import {
   changePasswordSchema,
   type ForgotPasswordDto,
   forgotPasswordSchema,
+  type ImpersonationTicketDto,
+  impersonationTicketSchema,
   type MfaCodeDto,
   mfaCodeSchema,
   type MfaTokenDto,
@@ -116,7 +119,7 @@ export class StaffAuthController {
     await this.auth.setPassword(body);
   }
 
-  @Roles('TEACHER', 'SUPERVISOR', 'ADMIN')
+  @Roles('TEACHER', 'SUPERVISOR', 'ADMIN', 'EMPLOYEE')
   @Throttle({ default: { limit: 10, ttl: 15 * MINUTE_MS } })
   @Post('password/change')
   @HttpCode(204)
@@ -125,12 +128,36 @@ export class StaffAuthController {
     @Body({ schema: changePasswordSchema }) body: ChangePasswordDto,
     @Res({ passthrough: true }) response: Response,
   ) {
+    // The password is the account owner's own, so an admin inside the account can't change it.
+    if (staff.impersonatorId) throw new ApiError(403, 'forbidden');
     setStaffCookies(response, await this.auth.changePassword(staff.id, body));
   }
 
-  @Roles('TEACHER', 'SUPERVISOR', 'ADMIN')
+  /**
+   * The one-time link an admin pastes into a private window to open a teacher's or supervisor's dashboard. Under this
+   * path so the admin's refresh cookie comes with it: the window lasts only as long as the admin's own session.
+   */
+  @Roles('ADMIN')
+  @Throttle({ default: { limit: 30, ttl: 15 * MINUTE_MS } })
+  @Post('impersonate/:id')
+  @HttpCode(200)
+  impersonate(@CurrentStaff() admin: StaffActor, @Param('id', { schema: idSchema }) id: string, @Req() request: Request) {
+    return this.auth.impersonate(admin, id, readRefreshCookie(request));
+  }
+
+  /** Run by the private window. The link is the only proof it has: it holds no cookie of the admin's. */
+  @Public()
+  @Throttle({ default: { limit: 20, ttl: 15 * MINUTE_MS } })
+  @Post('impersonate')
+  @HttpCode(200)
+  redeemImpersonation(@Body({ schema: impersonationTicketSchema }) body: ImpersonationTicketDto) {
+    return this.auth.redeemImpersonation(body.ticket);
+  }
+
+  @Roles('TEACHER', 'SUPERVISOR', 'ADMIN', 'EMPLOYEE')
   @Get('me')
-  me(@CurrentStaff() staff: StaffActor) {
-    return this.auth.profile(staff.id);
+  async me(@CurrentStaff() staff: StaffActor) {
+    const profile = await this.auth.profile(staff.id);
+    return { ...profile, impersonatedBy: staff.impersonatorId ? await this.auth.impersonator(staff.impersonatorId) : null };
   }
 }

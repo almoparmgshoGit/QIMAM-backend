@@ -1,7 +1,7 @@
 import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import { z } from 'zod';
 
-const AGE_BANDS = ['15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25+'] as const;
+export const AGE_BANDS = ['15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25+'] as const;
 
 /** Accepts the international format and stores E.164, so one number can only ever be one account. */
 export const phoneSchema = z
@@ -30,14 +30,23 @@ const registrationFields = {
     // Letters, marks and spaces in any language: no markup and no control characters.
     .refine((name) => /^[\p{L}\p{M}\s'’-]+$/u.test(name), 'full name has invalid characters'),
   country: z.string().trim().min(1).max(80),
+  /** Asked of residents of Saudi Arabia only. Older copies of the app send neither. */
+  region: z.string().trim().min(1).max(80).nullable().optional(),
+  city: z.string().trim().min(1).max(80).nullable().optional(),
   ageBand: z.enum(AGE_BANDS),
-  trackId: trackSchema,
-  trackStart: trackStartSchema.nullable(),
+  /** The men's or the women's section. Circles never mix them, and the app's wording follows it. */
+  section: z.enum(['women', 'men']),
+  /**
+   * The track is chosen after the admission test, by the teacher who gave it or by the student once accepted.
+   * Older copies of the app still send one here, and it is taken.
+   */
+  trackId: trackSchema.optional(),
+  trackStart: trackStartSchema.nullable().optional(),
   pledgesAccepted: z.literal(true),
 };
 
-const trackStartMatchesTrack = (data: { trackId: string; trackStart: string | null }) =>
-  (data.trackId === 'stabilization') === (data.trackStart !== null);
+const trackStartMatchesTrack = (data: { trackId?: string; trackStart?: string | null }) =>
+  (data.trackId === 'stabilization') === (data.trackStart != null);
 const TRACK_START_ERROR = { message: 'trackStart goes with the stabilization track only', path: ['trackStart'] };
 
 const registrationSchema = z.strictObject(registrationFields).refine(trackStartMatchesTrack, TRACK_START_ERROR);

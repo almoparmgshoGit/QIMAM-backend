@@ -26,6 +26,8 @@ enum Role {
   TEACHER
   SUPERVISOR
   ADMIN
+  /// An administration employee: uses the admin dashboard, limited to what their rank allows.
+  EMPLOYEE
 }
 
 enum AccountStatus {
@@ -53,6 +55,14 @@ enum AdmissionStatus {
   PENDING
   ACCEPTED
   REJECTED
+}
+
+/// SCHEDULED with no time yet means it waits for the supervisor or the student to pick one.
+enum AdmissionTestStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
 }
 
 enum ConsentType {
@@ -114,6 +124,25 @@ enum SegmentStatus {
 enum LiveSessionKind {
   RECITATION
   CORRECTION
+  /// حلقة الإسماع: the whole circle in one voice room, each student reciting in turn.
+  ISMA
+}
+
+/// Who may be in an isma room. OPEN: every student of the circle, all session long. TURN: a student only once her turn has begun.
+enum IsmaEntryMode {
+  OPEN
+  TURN
+}
+
+enum IsmaTurnStatus {
+  WAITING
+  ACTIVE
+  DONE
+}
+
+enum IsmaMarkKind {
+  MISTAKE
+  WARNING
 }
 
 enum StudentSection {
@@ -124,12 +153,69 @@ enum StudentSection {
 enum TrackKind {
   MEMORIZATION
   CORRECTION
+  /// Review and verification of what a student already holds. It runs a plan like memorization, and ends with a final
+  /// recitation or exam whose pass may move the student to a main track.
+  REVIEW
+}
+
+/// When a review track's student may ask for the final recitation or exam.
+enum ReviewEndRule {
+  /// Once the track's duration has passed since the plan began.
+  DURATION
+  /// Once the whole scope has been reviewed.
+  SCOPE
+  /// At whichever of the two comes first.
+  EITHER
+}
+
+/// The test that ends a review track.
+enum ReviewFinalKind {
+  /// A recitation to the circle's teacher.
+  RECITATION
+  /// An exam with an examiner the supervisor assigns.
+  EXAM
+}
+
+/// What a failed final recitation or exam leads to.
+enum ReviewFailAction {
+  /// The student may ask for it again at once.
+  RETAKE
+  /// The review goes on for reviewExtendDays more, then the student may ask again.
+  EXTEND
+  /// The review begins again from its start.
+  RESTART
+}
+
+/// Who moves a student who passed to a main track.
+enum ReviewMoveMode {
+  /// The program moves her to reviewNextTrackId at once.
+  AUTO
+  /// The examiner chooses the main track, or none, when recording the result.
+  EXAMINER
+}
+
+/// How a track's students recite each portion to the teacher, and so how the wird's session step is done.
+enum RecitationMode {
+  /// In a voice session with the teacher, online.
+  LIVE
+  /// By a recording sent from the app, which the teacher evaluates.
+  RECORDING
+  /// Not at all: the session step is left out of the wird.
+  NONE
+}
+
+/// Where a memorization track begins and which way it goes. See surahOrderFor.
+enum MemorizationOrder {
+  FORWARD
+  BACKWARD
 }
 
 enum DailyUnit {
   HALF_PAGE
   PAGE
   SURAH
+  /// A set number of ayahs a day, from dailyAyahs. For a track of chosen surahs.
+  AYAHS
 }
 
 enum GateMode {
@@ -139,9 +225,48 @@ enum GateMode {
   PAUSED
 }
 
+/// Whether a track tests each seventh of the Quran its students finish, and whether new memorization waits for it.
+enum StageExamMode {
+  OFF
+  REQUIRED
+  BLOCKING
+}
+
+/// WAITING has no time yet: it waits for whoever the settings let set one.
+enum StageExamSessionStatus {
+  WAITING
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+/// The mistakes an examiner records in a stage exam, each taking off what the settings say.
+enum StageExamMarkKind {
+  /// خطأ حفظ: a word or ayah forgotten, changed or dropped.
+  HIFZ
+  /// تنبيه: the student stopped and the examiner prompted her.
+  PROMPT
+  /// تردد: hesitating or repeating, without a clear mistake.
+  HESITATION
+  /// لحن خفي: a tajweed rule missed.
+  TAJWEED
+}
+
 enum PlanStatus {
   ACTIVE
   COMPLETED
+}
+
+enum CertificateTrigger {
+  /// Issued by the administration to the students it picks.
+  MANUAL
+  /// Issued by the program when a student finishes a track.
+  TRACK_COMPLETED
+  /// Given to every student of a circle when the administration honors it.
+  CIRCLE_HONOR
+  /// Given to the circle's teacher when the administration honors it.
+  CIRCLE_HONOR_TEACHER
 }
 
 enum GateStatus {
@@ -213,6 +338,9 @@ model User {
   /// Lowercased. Staff sign in with this.
   email              String?             @unique @db.VarChar(254)
   country            String?             @db.VarChar(80)
+  /// A resident of Saudi Arabia gives a region and a city. Other countries leave both null.
+  region             String?             @db.VarChar(80)
+  city               String?             @db.VarChar(80)
   /// The value the app collects: "15" to "24", or "25+".
   ageBand            String?             @map("age_band") @db.VarChar(3)
   trackId            TrackId?            @map("track_id")
@@ -220,6 +348,8 @@ model User {
   language           Language            @default(AR)
   /// The supervision scope of a supervisor or teacher. Students have none.
   scopeId            String?             @map("scope_id") @db.VarChar(32)
+  /// An employee's rank, which says what they may do. Every employee has one, and no one else does.
+  rankId             String?             @map("rank_id") @db.VarChar(32)
   section            StudentSection      @default(WOMEN)
   /// The track a student is on. trackId stays as the app's short name for the original tracks.
   trackTemplateId    String?             @map("track_template_id") @db.VarChar(32)
@@ -235,47 +365,79 @@ model User {
   createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz
   updatedAt          DateTime            @updatedAt @map("updated_at") @db.Timestamptz
 
-  scope              Scope?                   @relation(fields: [scopeId], references: [id], onDelete: SetNull)
-  trackTemplate      TrackTemplate?           @relation(fields: [trackTemplateId], references: [id], onDelete: SetNull)
-  plan               StudentPlan?
-  dayCompletions     DayCompletion[]
-  reflections        TadabburReflection[]
-  gates              SurahGate[]              @relation("GateStudent")
-  gatesDecided       SurahGate[]              @relation("GateDecider")
-  skipRequests       SkipRequest[]            @relation("SkipStudent")
-  skipsDecided       SkipRequest[]            @relation("SkipDecider")
-  gateExceptions     GateException[]          @relation("ExceptionStudent")
-  exceptionsCreated  GateException[]          @relation("ExceptionCreator")
-  stageExams         StageExam[]              @relation("ExamStudent")
-  examsGiven         StageExam[]              @relation("ExamTeacher")
-  practicalsDone     PracticalCompletion[]
-  notifications      Notification[]
-  staffCredential    StaffCredential?
-  staffTokens        StaffSecurityToken[]
-  consents           UserConsent[]
-  refreshTokens      RefreshToken[]
-  notificationPrefs  NotificationPreference[]
-  pushDevices        PushDevice[]
-  taughtCircles      Circle[]                 @relation("CircleTeacher")
-  memberships        CircleMembership[]
-  createdTasks       Task[]                   @relation("TaskCreator")
-  assignedTasks      Task[]                   @relation("TaskStudent")
-  transfers          TransferRequest[]        @relation("TransferStudent")
-  transfersRequested TransferRequest[]        @relation("TransferRequester")
-  taskCompletions    TaskCompletion[]
-  evaluationsGiven   Evaluation[]             @relation("EvaluationTeacher")
-  evaluationsGot     Evaluation[]             @relation("EvaluationStudent")
-  sessionsTaught     LiveSession[]            @relation("SessionTeacher")
-  sessionsAttended   LiveSession[]            @relation("SessionStudent")
-  absenceWarnings    AbsenceWarning[]         @relation("WarningStudent")
-  warningsIssued     AbsenceWarning[]         @relation("WarningIssuer")
-  announcements      Announcement[]
-  badges             StudentBadge[]           @relation("BadgeStudent")
-  badgesAwarded      StudentBadge[]           @relation("BadgeAwarder")
+  scope                  Scope?                   @relation(fields: [scopeId], references: [id], onDelete: SetNull)
+  rank                   StaffRank?               @relation(fields: [rankId], references: [id], onDelete: Restrict)
+  trackTemplate          TrackTemplate?           @relation(fields: [trackTemplateId], references: [id], onDelete: SetNull)
+  plan                   StudentPlan?
+  dayCompletions         DayCompletion[]
+  reflections            TadabburReflection[]
+  gates                  SurahGate[]              @relation("GateStudent")
+  gatesDecided           SurahGate[]              @relation("GateDecider")
+  skipRequests           SkipRequest[]            @relation("SkipStudent")
+  skipsDecided           SkipRequest[]            @relation("SkipDecider")
+  trackChanges           TrackChangeRequest[]     @relation("TrackChangeStudent")
+  trackChangesDecided    TrackChangeRequest[]     @relation("TrackChangeDecider")
+  gateExceptions         GateException[]          @relation("ExceptionStudent")
+  exceptionsCreated      GateException[]          @relation("ExceptionCreator")
+  stageExams             StageExam[]              @relation("ExamStudent")
+  examsGiven             StageExam[]              @relation("ExamTeacher")
+  practicalsDone         PracticalCompletion[]
+  notifications          Notification[]
+  teacherIncentives      TeacherIncentive[]       @relation("TeacherIncentives")
+  staffCredential        StaffCredential?
+  staffTokens            StaffSecurityToken[]
+  consents               UserConsent[]
+  refreshTokens          RefreshToken[]
+  notificationPrefs      NotificationPreference[]
+  pushDevices            PushDevice[]
+  taughtCircles          Circle[]                 @relation("CircleTeacher")
+  memberships            CircleMembership[]
+  createdTasks           Task[]                   @relation("TaskCreator")
+  assignedTasks          Task[]                   @relation("TaskStudent")
+  transfers              TransferRequest[]        @relation("TransferStudent")
+  transfersRequested     TransferRequest[]        @relation("TransferRequester")
+  taskCompletions        TaskCompletion[]
+  evaluationsGiven       Evaluation[]             @relation("EvaluationTeacher")
+  evaluationsGot         Evaluation[]             @relation("EvaluationStudent")
+  sessionsTaught         LiveSession[]            @relation("SessionTeacher")
+  sessionsAttended       LiveSession[]            @relation("SessionStudent")
+  ismaTurns              IsmaTurn[]               @relation("IsmaTurnStudent")
+  absenceWarnings        AbsenceWarning[]         @relation("WarningStudent")
+  warningsIssued         AbsenceWarning[]         @relation("WarningIssuer")
+  announcements          Announcement[]
+  badges                 StudentBadge[]           @relation("BadgeStudent")
+  badgesAwarded          StudentBadge[]           @relation("BadgeAwarder")
+  admissionTests         AdmissionTest[]          @relation("AdmissionTestStudent")
+  admissionsTesting      AdmissionTest[]          @relation("AdmissionTestTeacher")
+  admissionSlots         AdmissionSlot[]
+  stageSessions          StageExamSession[]       @relation("StageSessionStudent")
+  stageSessionsExamining StageExamSession[]       @relation("StageSessionExaminer")
+  certificates           IssuedCertificate[]      @relation("CertificateStudent")
+  certificatesIssued     IssuedCertificate[]      @relation("CertificateIssuer")
+  recordings             RecitationRecording[]
+  supportTickets         SupportTicket[]          @relation("SupportRequester")
+  supportAssigned        SupportTicket[]          @relation("SupportAssignee")
+  supportMessages        SupportMessage[]         @relation("SupportMessageAuthor")
 
   @@index([role, status])
   @@index([admissionStatus])
+  @@index([rankId])
   @@map("users")
+}
+
+/// A rank the administration defines for its employees: a name and the permissions it grants.
+/// The permission keys are listed in src/auth/permissions.ts. A rank in use cannot be deleted.
+model StaffRank {
+  id          String   @id @default(nanoid(32)) @db.VarChar(32)
+  name        String   @unique @db.VarChar(80)
+  description String?  @db.VarChar(300)
+  permissions String[] @default([])
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  users User[]
+
+  @@map("staff_ranks")
 }
 
 /// Staff only: students have no password. Argon2id hash; TOTP secret encrypted at rest.
@@ -332,7 +494,8 @@ model OtpChallenge {
   id          String     @id @default(nanoid(32)) @db.VarChar(32)
   phone       String     @db.VarChar(20)
   purpose     OtpPurpose
-  codeHmac    String     @map("code_hmac")
+  /// Null when the provider makes and keeps the code.
+  codeHmac    String?    @map("code_hmac")
   attempts    Int        @default(0)
   maxAttempts Int        @default(5) @map("max_attempts")
   expiresAt   DateTime   @map("expires_at") @db.Timestamptz
@@ -422,17 +585,21 @@ model Circle {
   createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
   updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
-  teacher       User?              @relation("CircleTeacher", fields: [teacherId], references: [id], onDelete: Restrict)
-  trackTemplate TrackTemplate?     @relation(fields: [trackTemplateId], references: [id], onDelete: SetNull)
+  teacher       User?                 @relation("CircleTeacher", fields: [teacherId], references: [id], onDelete: Restrict)
+  trackTemplate TrackTemplate?        @relation(fields: [trackTemplateId], references: [id], onDelete: SetNull)
   stageExams    StageExam[]
-  scope         Scope              @relation(fields: [scopeId], references: [id], onDelete: Restrict)
+  stageSessions StageExamSession[]
+  scope         Scope                 @relation(fields: [scopeId], references: [id], onDelete: Restrict)
   memberships   CircleMembership[]
   tasks         Task[]
   sessions      LiveSession[]
   announcements Announcement[]
   evaluations   Evaluation[]
-  transfersFrom TransferRequest[]  @relation("TransferFrom")
-  transfersTo   TransferRequest[]  @relation("TransferTo")
+  certificates  IssuedCertificate[]
+  transfersFrom TransferRequest[]     @relation("TransferFrom")
+  transfersTo   TransferRequest[]     @relation("TransferTo")
+  trackChanges  TrackChangeRequest[]
+  recordings    RecitationRecording[]
 
   @@index([teacherId])
   @@index([scopeId])
@@ -542,11 +709,13 @@ model Evaluation {
   comment       String?           @db.VarChar(1000)
   createdAt     DateTime          @default(now()) @map("created_at") @db.Timestamptz
 
-  student     User            @relation("EvaluationStudent", fields: [studentId], references: [id], onDelete: Cascade)
-  teacher     User?           @relation("EvaluationTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
-  liveSession LiveSession?    @relation(fields: [liveSessionId], references: [id], onDelete: SetNull)
-  circle      Circle?         @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  student     User                 @relation("EvaluationStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  teacher     User?                @relation("EvaluationTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+  liveSession LiveSession?         @relation(fields: [liveSessionId], references: [id], onDelete: SetNull)
+  circle      Circle?              @relation(fields: [circleId], references: [id], onDelete: SetNull)
   reviews     SegmentReview[]
+  /// Set when this evaluation was given to a recording the student sent from the app.
+  recording   RecitationRecording?
 
   @@unique([studentId, attendanceOn])
   @@index([studentId, createdAt])
@@ -565,6 +734,47 @@ model SegmentReview {
 
   @@id([evaluationId, doneOn])
   @@map("segment_reviews")
+}
+
+/// A recitation the student recorded in the app and sent to her teacher, in place of reciting live.
+/// It waits until a teacher (or a supervisor of the scope) plays it and evaluates it. The evaluation then
+/// joins the student's segments like any other, with its score, note and level.
+model RecitationRecording {
+  id           String    @id @default(nanoid(32)) @db.VarChar(32)
+  studentId    String    @map("student_id") @db.VarChar(32)
+  /// The circle when it was sent, so it reaches that circle's teacher and stays there after a transfer.
+  circleId     String?   @map("circle_id") @db.VarChar(32)
+  title        String    @db.VarChar(200)
+  surah        Int       @db.SmallInt
+  fromAyah     Int       @map("from_ayah") @db.SmallInt
+  toAyah       Int       @map("to_ayah") @db.SmallInt
+  durationMs   Int       @map("duration_ms")
+  mimeType     String    @map("mime_type") @db.VarChar(40)
+  sizeBytes    Int       @map("size_bytes")
+  /// Null while it waits for an evaluation.
+  evaluationId String?   @unique @map("evaluation_id") @db.VarChar(32)
+  reviewedAt   DateTime? @map("reviewed_at") @db.Timestamptz
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  student    User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  circle     Circle?          @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  evaluation Evaluation?      @relation(fields: [evaluationId], references: [id], onDelete: SetNull)
+  audio      RecitationAudio?
+
+  @@index([studentId, createdAt])
+  @@index([circleId, evaluationId])
+  @@map("recitation_recordings")
+}
+
+/// The sound itself, kept apart so lists never read it.
+model RecitationAudio {
+  recordingId String @id @map("recording_id") @db.VarChar(32)
+  /// Only for files saved before they moved to the uploads folder. New files are written to disk.
+  data        Bytes?
+
+  recording RecitationRecording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+
+  @@map("recitation_audio")
 }
 
 // ---------- Live sessions ----------
@@ -586,17 +796,98 @@ model LiveSession {
   attendance  AttendanceStatus?
   startedAt   DateTime?         @map("started_at") @db.Timestamptz
   endedAt     DateTime?         @map("ended_at") @db.Timestamptz
+  /// Set on an isma session only.
+  entryMode   IsmaEntryMode?    @map("entry_mode")
   createdAt   DateTime          @default(now()) @map("created_at") @db.Timestamptz
 
   circle      Circle?      @relation(fields: [circleId], references: [id], onDelete: SetNull)
   teacher     User?        @relation("SessionTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
   student     User?        @relation("SessionStudent", fields: [studentId], references: [id], onDelete: SetNull)
   evaluations Evaluation[]
+  turns       IsmaTurn[]
 
   @@index([studentId, scheduledAt])
   @@index([teacherId, scheduledAt])
   @@index([status, scheduledAt])
   @@map("live_sessions")
+}
+
+/// One student's place in an isma session's queue. The queue is taken from the circle when the session starts.
+model IsmaTurn {
+  id         String            @id @default(nanoid(32)) @db.VarChar(32)
+  sessionId  String            @map("session_id") @db.VarChar(32)
+  studentId  String            @map("student_id") @db.VarChar(32)
+  /// From 1. The teacher reorders the queue during the session.
+  position   Int               @db.SmallInt
+  status     IsmaTurnStatus    @default(WAITING)
+  /// What the teacher marked in the room. It is written to the day's attendance at once.
+  attendance AttendanceStatus?
+  /// The first time she entered the room.
+  joinedAt   DateTime?         @map("joined_at") @db.Timestamptz
+  startedAt  DateTime?         @map("started_at") @db.Timestamptz
+  endedAt    DateTime?         @map("ended_at") @db.Timestamptz
+
+  session LiveSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  student User        @relation("IsmaTurnStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  marks   IsmaMark[]
+
+  @@unique([sessionId, studentId])
+  @@index([sessionId, position])
+  @@map("isma_turns")
+}
+
+/// A mistake or a warning the teacher counted while a student recited.
+model IsmaMark {
+  id        String       @id @default(nanoid(32)) @db.VarChar(32)
+  turnId    String       @map("turn_id") @db.VarChar(32)
+  kind      IsmaMarkKind
+  note      String?      @db.VarChar(500)
+  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz
+
+  turn IsmaTurn @relation(fields: [turnId], references: [id], onDelete: Cascade)
+
+  @@index([turnId, createdAt])
+  @@map("isma_marks")
+}
+
+/// The recitation test before admission. Audio only, in its own room apart from the teacher's sessions,
+/// and nothing is recorded. A student has at most one test that is SCHEDULED or IN_PROGRESS.
+model AdmissionTest {
+  id          String              @id @default(nanoid(32)) @db.VarChar(32)
+  studentId   String              @map("student_id") @db.VarChar(32)
+  teacherId   String?             @map("teacher_id") @db.VarChar(32)
+  scheduledAt DateTime?           @map("scheduled_at") @db.Timestamptz
+  status      AdmissionTestStatus @default(SCHEDULED)
+  startedAt   DateTime?           @map("started_at") @db.Timestamptz
+  endedAt     DateTime?           @map("ended_at") @db.Timestamptz
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz
+
+  student User           @relation("AdmissionTestStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  teacher User?          @relation("AdmissionTestTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+  slot    AdmissionSlot?
+
+  @@index([studentId, status])
+  @@index([teacherId, status])
+  @@map("admission_tests")
+}
+
+/// A time a teacher offers for admission tests. A student books it when the settings let her choose.
+model AdmissionSlot {
+  id             String   @id @default(nanoid(32)) @db.VarChar(32)
+  teacherId      String   @map("teacher_id") @db.VarChar(32)
+  startsAt       DateTime @map("starts_at") @db.Timestamptz
+  /// The test that booked it. Null while free.
+  testId         String?  @unique @map("test_id") @db.VarChar(32)
+  /// Or the stage exam that booked it. A time is booked by one or the other, never both.
+  stageSessionId String?  @unique @map("stage_session_id") @db.VarChar(32)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  teacher      User              @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  test         AdmissionTest?    @relation(fields: [testId], references: [id], onDelete: SetNull)
+  stageSession StageExamSession? @relation(fields: [stageSessionId], references: [id], onDelete: SetNull)
+
+  @@unique([teacherId, startsAt])
+  @@map("admission_slots")
 }
 
 model AbsenceWarning {
@@ -645,29 +936,85 @@ model Announcement {
   @@map("announcements")
 }
 
+/// How a badge looks: an icon from the shared set, an emoji, or an uploaded 256×256 PNG.
+enum BadgeVisual {
+  ICON
+  EMOJI
+  IMAGE
+}
+
+/// Who may hold a badge. STAFF covers teachers and supervisors.
+enum BadgeAudience {
+  STUDENTS
+  STAFF
+  EVERYONE
+}
+
+/// MANUAL is given by staff. The others are given by the program once the student reaches `threshold`.
+enum BadgeTrigger {
+  MANUAL
+  SURAH_PASSED
+  PAGES_MEMORIZED
+  WIRD_DAYS
+  TRACK_COMPLETED
+}
+
 model Badge {
-  id        String  @id @default(nanoid(32)) @db.VarChar(32)
-  code      String  @unique @db.VarChar(40)
-  label     String  @db.VarChar(60)
-  condition String? @db.VarChar(200)
-  icon      String  @db.VarChar(40)
+  id                 String        @id @default(nanoid(32)) @db.VarChar(32)
+  code               String        @unique @db.VarChar(40)
+  label              String        @db.VarChar(60)
+  condition          String?       @db.VarChar(200)
+  visual             BadgeVisual   @default(ICON)
+  /// An icon name for ICON, the emoji itself for EMOJI. Unused for IMAGE.
+  icon               String        @db.VarChar(40)
+  /// The badge's accent, as #RRGGBB.
+  color              String        @default("#B8860B") @db.VarChar(7)
+  audience           BadgeAudience @default(STUDENTS)
+  trigger            BadgeTrigger  @default(MANUAL)
+  /// The count an automatic trigger waits for. Null for MANUAL and TRACK_COMPLETED.
+  threshold          Int?
+  /// Administrators can always award a badge by hand. This lets supervisors award it too.
+  supervisorCanAward Boolean       @default(true) @map("supervisor_can_award")
+  /// An inactive badge is no longer awarded, and shows only to those who already hold it.
+  active             Boolean       @default(true)
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
   awards StudentBadge[]
+  image  BadgeImage?
 
   @@map("badges")
 }
 
+/// Kept apart from badges so listing badges never loads the pictures.
+model BadgeImage {
+  badgeId   String   @id @map("badge_id") @db.VarChar(32)
+  /// Only for files saved before they moved to the uploads folder. New files are written to disk.
+  data      Bytes?
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  badge Badge @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+
+  @@map("badge_images")
+}
+
+/// A badge held by a user. Despite the name, `studentId` may also be a teacher or a supervisor.
 model StudentBadge {
-  studentId   String   @map("student_id") @db.VarChar(32)
-  badgeId     String   @map("badge_id") @db.VarChar(32)
-  awardedById String?  @map("awarded_by_id") @db.VarChar(32)
-  awardedAt   DateTime @default(now()) @map("awarded_at") @db.Timestamptz
+  studentId   String    @map("student_id") @db.VarChar(32)
+  badgeId     String    @map("badge_id") @db.VarChar(32)
+  awardedById String?   @map("awarded_by_id") @db.VarChar(32)
+  awardedAt   DateTime  @default(now()) @map("awarded_at") @db.Timestamptz
+  /// Why it was given, shown to the holder. Only for badges given by hand.
+  note        String?   @db.VarChar(200)
+  /// When the holder chose to show it on her profile. At most three are pinned. Null when not pinned.
+  pinnedAt    DateTime? @map("pinned_at") @db.Timestamptz
 
   student   User  @relation("BadgeStudent", fields: [studentId], references: [id], onDelete: Cascade)
   badge     Badge @relation(fields: [badgeId], references: [id], onDelete: Cascade)
   awardedBy User? @relation("BadgeAwarder", fields: [awardedById], references: [id], onDelete: SetNull)
 
   @@id([studentId, badgeId])
+  @@index([awardedAt])
   @@map("student_badges")
 }
 
@@ -675,40 +1022,78 @@ model StudentBadge {
 
 /// A track's rules. Each student's plan is computed from these.
 model TrackTemplate {
-  id                String     @id @default(nanoid(32)) @db.VarChar(32)
+  id                String            @id @default(nanoid(32)) @db.VarChar(32)
   /// Short stable name: the app's track id for the original tracks.
-  code              String     @unique @db.VarChar(40)
+  code              String            @unique @db.VarChar(40)
   kind              TrackKind
-  name              String     @db.VarChar(120)
-  audience          String     @db.VarChar(200)
-  duration          String     @db.VarChar(60)
-  active            Boolean    @default(true)
-  gateMode          GateMode   @default(ACTIVE) @map("gate_mode")
-  dailyUnit         DailyUnit? @map("daily_unit")
+  name              String            @db.VarChar(120)
+  audience          String            @db.VarChar(200)
+  /// The length in words, made from durationMonths.
+  duration          String            @db.VarChar(60)
+  /// Null only for a track written before lengths were counted, until it is edited.
+  durationMonths    Int?              @map("duration_months") @db.SmallInt
+  active            Boolean           @default(true)
+  gateMode          GateMode          @default(ACTIVE) @map("gate_mode")
+  stageExamMode     StageExamMode     @default(REQUIRED) @map("stage_exam_mode")
+  /// Online voice sessions, recordings, or neither. It decides what finishes the wird's session step.
+  recitationMode    RecitationMode    @default(LIVE) @map("recitation_mode")
+  dailyUnit         DailyUnit?        @map("daily_unit")
+  /// The ayahs memorized each day when dailyUnit is AYAHS, and null otherwise.
+  dailyAyahs        Int?              @map("daily_ayahs") @db.SmallInt
+  /// Optional: the day's portion is split by ayahs into this many sessions, such as morning and evening. Null keeps it whole.
+  dailySessions     Int?              @map("daily_sessions") @db.SmallInt
   /// Week days with new memorization, Sunday = 0. Other days are for review and rest.
-  wirdDays          Int[]      @map("wird_days")
+  wirdDays          Int[]             @map("wird_days")
   /// Days to consolidate and study tafsir after each surah.
-  consolidationDays Int        @default(1) @map("consolidation_days") @db.SmallInt
-  /// Surah numbers in the order they are memorized.
-  surahOrder        Int[]      @map("surah_order")
+  consolidationDays Int               @default(1) @map("consolidation_days") @db.SmallInt
+  /// Surah numbers in the order they are memorized, made from memorizationOrder.
+  surahOrder        Int[]             @map("surah_order")
+  memorizationOrder MemorizationOrder @default(FORWARD) @map("memorization_order")
+  /// The surah the track begins at. The order goes on from it in its direction and comes round to the surahs before it.
+  /// Null begins at the order's own start. Not used with a juz' range.
+  startSurah        Int?              @map("start_surah") @db.SmallInt
+  /// Surahs the administration chose. Empty for the whole Quran or a juz' range.
+  selectedSurahs    Int[]             @default([]) @map("selected_surahs")
+  /// A juz' range, both included. Null for the whole Quran.
+  juzFrom           Int?              @map("juz_from") @db.SmallInt
+  juzTo             Int?              @map("juz_to") @db.SmallInt
   /// The day's wird, in order. Null means the program's default steps.
-  wirdSteps         Json?      @map("wird_steps")
+  wirdSteps         Json?             @map("wird_steps")
   /// How many times today's portion is repeated from memory.
-  repeatTarget      Int        @default(35) @map("repeat_target") @db.SmallInt
+  repeatTarget      Int               @default(35) @map("repeat_target") @db.SmallInt
   /// How many times the previous portion is reviewed.
-  reviewTarget      Int        @default(5) @map("review_target") @db.SmallInt
+  reviewTarget      Int               @default(5) @map("review_target") @db.SmallInt
+  /// How many times the sheikh's recitation of today's portion is heard.
+  listenTarget      Int               @default(1) @map("listen_target") @db.SmallInt
   /// Words of encouragement shown when a counted step is finished, written by whoever made the track.
-  encouragements    String[]   @default([])
-  focus             String?    @db.VarChar(120)
-  sessionsPerWeek   Int?       @map("sessions_per_week") @db.SmallInt
-  application       String?    @db.VarChar(120)
-  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz
+  encouragements    String[]          @default([])
+  focus             String?           @db.VarChar(120)
+  sessionsPerWeek   Int?              @map("sessions_per_week") @db.SmallInt
+  application       String?           @db.VarChar(120)
+  /// REVIEW only: when the student may ask for the final test.
+  reviewEndRule     ReviewEndRule?    @map("review_end_rule")
+  /// REVIEW only: the final tests offered. Two lets the student choose.
+  reviewFinalKinds  ReviewFinalKind[] @default([]) @map("review_final_kinds")
+  /// REVIEW only: out of 10. Null takes the stage exam's pass score.
+  reviewPassScore   Decimal?          @map("review_pass_score") @db.Decimal(3, 1)
+  reviewFailAction  ReviewFailAction? @map("review_fail_action")
+  /// REVIEW only: the days a failed test adds to the review, with EXTEND.
+  reviewExtendDays  Int?              @map("review_extend_days") @db.SmallInt
+  reviewMoveMode    ReviewMoveMode?   @map("review_move_mode")
+  /// REVIEW only: the main track a student who passed moves to. With EXAMINER it is the one suggested.
+  reviewNextTrackId String?           @map("review_next_track_id") @db.VarChar(32)
+  createdAt         DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime          @updatedAt @map("updated_at") @db.Timestamptz
 
   students      User[]
   circles       Circle[]
   plans         StudentPlan[]
   announcements Announcement[]
+  certificates  CertificateTemplate[]
+  changesFrom   TrackChangeRequest[]  @relation("TrackChangeFrom")
+  changesTo     TrackChangeRequest[]  @relation("TrackChangeTo")
+  reviewNextTrack TrackTemplate?      @relation("ReviewNextTrack", fields: [reviewNextTrackId], references: [id], onDelete: SetNull)
+  reviewFrom      TrackTemplate[]     @relation("ReviewNextTrack")
 
   @@map("track_templates")
 }
@@ -722,10 +1107,14 @@ model StudentPlan {
   startOn        DateTime   @map("start_on") @db.Date
   /// Surah numbers in this student's own order, fixed when the plan starts.
   surahOrder     Int[]      @map("surah_order")
+  /// The first and last page memorized, from the track's juz' range when the plan starts. Empty for the whole Quran.
+  pageRange      Int[]      @default([]) @map("page_range")
   /// How many units are done. The next one to memorize has this index.
   completedUnits Int        @default(0) @map("completed_units")
   /// Days spent waiting on a gate, which don't count as falling behind.
   creditedDays   Int        @default(0) @map("credited_days")
+  /// On a review track: the day its duration ends, moved on by a failed final test with EXTEND. Null otherwise.
+  reviewEndsOn   DateTime?  @map("review_ends_on") @db.Date
   /// When the student finished the track. The date on the certificate.
   completedAt    DateTime?  @map("completed_at") @db.Timestamptz
   createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz
@@ -757,13 +1146,16 @@ model WirdLog {
 
 /// A unit's daily steps while the student works through it, so they carry across devices.
 model WirdProgress {
-  planId      String   @map("plan_id") @db.VarChar(32)
-  unitIndex   Int      @map("unit_index")
+  planId       String   @map("plan_id") @db.VarChar(32)
+  unitIndex    Int      @map("unit_index")
   /// Ids of the steps finished by their own button. The counted steps go by the counts below.
-  doneSteps   Int[]    @map("done_steps")
-  repeatCount Int      @default(0) @map("repeat_count") @db.SmallInt
-  reviewCount Int      @default(0) @map("review_count") @db.SmallInt
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  doneSteps    Int[]    @map("done_steps")
+  repeatCount  Int      @default(0) @map("repeat_count") @db.SmallInt
+  reviewCount  Int      @default(0) @map("review_count") @db.SmallInt
+  listenCount  Int      @default(0) @map("listen_count") @db.SmallInt
+  /// The day's sessions the student finished, numbered from 1, when the track splits the day.
+  doneSessions Int[]    @default([]) @map("done_sessions")
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   plan StudentPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
 
@@ -845,6 +1237,39 @@ model SkipRequest {
   @@map("skip_requests")
 }
 
+enum TrackChangeStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+/// A student in a circle asks to move to another track. The teacher decides; a student without a circle changes it herself.
+/// One pending request per student, held by a partial unique index in the migration.
+model TrackChangeRequest {
+  id          String            @id @default(nanoid(32)) @db.VarChar(32)
+  studentId   String            @map("student_id") @db.VarChar(32)
+  fromTrackId String?           @map("from_track_id") @db.VarChar(32)
+  toTrackId   String            @map("to_track_id") @db.VarChar(32)
+  /// The circle at the time, so the teacher and the supervisor of that circle see it.
+  circleId    String?           @map("circle_id") @db.VarChar(32)
+  reason      String            @db.VarChar(500)
+  status      TrackChangeStatus @default(PENDING)
+  decidedById String?           @map("decided_by_id") @db.VarChar(32)
+  decidedAt   DateTime?         @map("decided_at") @db.Timestamptz
+  createdAt   DateTime          @default(now()) @map("created_at") @db.Timestamptz
+
+  student   User           @relation("TrackChangeStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  decidedBy User?          @relation("TrackChangeDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+  fromTrack TrackTemplate? @relation("TrackChangeFrom", fields: [fromTrackId], references: [id], onDelete: SetNull)
+  toTrack   TrackTemplate  @relation("TrackChangeTo", fields: [toTrackId], references: [id], onDelete: Cascade)
+  circle    Circle?        @relation(fields: [circleId], references: [id], onDelete: SetNull)
+
+  @@index([studentId, status])
+  @@index([circleId, status])
+  @@map("track_change_requests")
+}
+
 model GateException {
   id          String            @id @default(nanoid(32)) @db.VarChar(32)
   studentId   String            @map("student_id") @db.VarChar(32)
@@ -867,18 +1292,95 @@ model StageExam {
   studentId String   @map("student_id") @db.VarChar(32)
   teacherId String?  @map("teacher_id") @db.VarChar(32)
   circleId  String?  @map("circle_id") @db.VarChar(32)
+  /// 0 for a review track's final test.
   stage     Int      @db.SmallInt
+  /// Set for a review track's final test.
+  finalKind ReviewFinalKind? @map("final_kind")
   score     Decimal  @db.Decimal(4, 1)
   passed    Boolean
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
 
-  student User    @relation("ExamStudent", fields: [studentId], references: [id], onDelete: Cascade)
-  teacher User?   @relation("ExamTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
-  circle  Circle? @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  student User              @relation("ExamStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  teacher User?             @relation("ExamTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+  circle  Circle?           @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  session StageExamSession?
 
   @@index([circleId, stage])
   @@index([studentId, stage])
   @@map("stage_exams")
+}
+
+/// The live one-to-one test of a seventh of the Quran, opened by the program when a student finishes it.
+/// Its result is a StageExam row. At most one is open per student and stage (a partial unique index).
+model StageExamSession {
+  id          String                 @id @default(nanoid(32)) @db.VarChar(32)
+  studentId   String                 @map("student_id") @db.VarChar(32)
+  /// The student's circle when it opened. Its scope's supervisors oversee it.
+  circleId    String?                @map("circle_id") @db.VarChar(32)
+  /// The seventh, 1 to 7, in the mushaf's order. 0 for a review track's final test.
+  stage       Int                    @db.SmallInt
+  /// Set for a review track's final recitation or exam, which tests the track's whole scope.
+  finalKind   ReviewFinalKind?       @map("final_kind")
+  /// The circle's teacher by default. The supervisor may give it to another teacher.
+  examinerId  String?                @map("examiner_id") @db.VarChar(32)
+  scheduledAt DateTime?              @map("scheduled_at") @db.Timestamptz
+  status      StageExamSessionStatus @default(WAITING)
+  startedAt   DateTime?              @map("started_at") @db.Timestamptz
+  endedAt     DateTime?              @map("ended_at") @db.Timestamptz
+  /// Set when the result is recorded.
+  examId      String?                @unique @map("exam_id") @db.VarChar(32)
+  /// A retake after a failed try.
+  retake      Boolean                @default(false)
+  /// The scoring rules the result was computed with, kept so later changes to the settings don't alter it.
+  scoring     Json?
+  /// The examiner's words on the result.
+  note        String?                @db.VarChar(500)
+  createdAt   DateTime               @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime               @updatedAt @map("updated_at") @db.Timestamptz
+
+  student  User            @relation("StageSessionStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  examiner User?           @relation("StageSessionExaminer", fields: [examinerId], references: [id], onDelete: SetNull)
+  circle   Circle?         @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  exam     StageExam?      @relation(fields: [examId], references: [id], onDelete: SetNull)
+  slot     AdmissionSlot?
+  items    StageExamItem[]
+
+  @@index([studentId, status])
+  @@index([examinerId, status])
+  @@index([circleId, status])
+  @@map("stage_exam_sessions")
+}
+
+/// A surah, or part of one, the student recited in a stage exam. Each is scored on its own.
+model StageExamItem {
+  id        String   @id @default(nanoid(32)) @db.VarChar(32)
+  sessionId String   @map("session_id") @db.VarChar(32)
+  surah     Int      @db.SmallInt
+  fromAyah  Int      @map("from_ayah") @db.SmallInt
+  toAyah    Int      @map("to_ayah") @db.SmallInt
+  /// Out of 10, set when the result is recorded.
+  score     Decimal? @db.Decimal(4, 2)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  session StageExamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  marks   StageExamMark[]
+
+  @@index([sessionId, createdAt])
+  @@map("stage_exam_items")
+}
+
+model StageExamMark {
+  id        String            @id @default(nanoid(32)) @db.VarChar(32)
+  itemId    String            @map("item_id") @db.VarChar(32)
+  kind      StageExamMarkKind
+  /// Where it was, such as the word, in the examiner's words.
+  note      String?           @db.VarChar(300)
+  createdAt DateTime          @default(now()) @map("created_at") @db.Timestamptz
+
+  item StageExamItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([itemId, createdAt])
+  @@map("stage_exam_marks")
 }
 
 // ---------- Content ----------
@@ -986,6 +1488,168 @@ model EncouragementMessage {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   @@map("encouragement_messages")
+}
+
+/// A motivational message from the administration to teachers, sent at once or at a set time.
+model TeacherIncentive {
+  id         String    @id @default(nanoid(32)) @db.VarChar(32)
+  title      String    @db.VarChar(160)
+  body       String    @db.VarChar(2000)
+  /// One teacher. Null sends to every active teacher.
+  teacherId  String?   @map("teacher_id") @db.VarChar(32)
+  sendAt     DateTime  @map("send_at") @db.Timestamptz
+  /// Set when it goes out. A row with none is still scheduled.
+  sentAt     DateTime? @map("sent_at") @db.Timestamptz
+  recipients Int?
+  authorId   String?   @map("author_id") @db.VarChar(32)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  teacher User? @relation("TeacherIncentives", fields: [teacherId], references: [id], onDelete: Cascade)
+
+  @@index([sentAt, sendAt])
+  @@map("teacher_incentives")
+}
+
+// ---------- Certificates ----------
+
+/// A kind of certificate and its design. The page is drawn on the device from this, so no PDF is stored per student.
+model CertificateTemplate {
+  id              String             @id @default(nanoid(32)) @db.VarChar(32)
+  name            String             @db.VarChar(120)
+  trigger         CertificateTrigger @default(MANUAL)
+  /// For TRACK_COMPLETED, the track it is for. Null means every track.
+  trackTemplateId String?            @map("track_template_id") @db.VarChar(32)
+  /// An inactive template is not issued any more. Certificates already issued stay with their students.
+  active          Boolean            @default(true)
+  /// The page size in points, 72 to the inch.
+  width           Int                @db.SmallInt
+  height          Int                @db.SmallInt
+  /// Texts with variables, frames and the logo, placed on the page. The shape is checked in certificates.schemas.ts.
+  elements        Json               @default("[]")
+  createdAt       DateTime           @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime           @updatedAt @map("updated_at") @db.Timestamptz
+
+  trackTemplate TrackTemplate?         @relation(fields: [trackTemplateId], references: [id], onDelete: Cascade)
+  background    CertificateBackground?
+  issued        IssuedCertificate[]
+
+  @@index([trigger, active])
+  @@map("certificate_templates")
+}
+
+/// The picture behind a design, kept apart so the image is read only when a page is drawn.
+model CertificateBackground {
+  templateId String   @id @map("template_id") @db.VarChar(32)
+  mimeType   String   @map("mime_type") @db.VarChar(20)
+  /// Only for files saved before they moved to the uploads folder. New files are written to disk.
+  data       Bytes?
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  template CertificateTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@map("certificate_backgrounds")
+}
+
+/// A picture a design can place over the page: a signature, a stamp, or a header with logos.
+/// Kept as a PNG with a clear background, on disk at certificates/assets/<id>.png.
+model CertificateAsset {
+  id        String   @id @default(nanoid(32)) @db.VarChar(32)
+  name      String   @db.VarChar(80)
+  /// SIGNATURE, STAMP or HEADER. Only sorts the library: every kind is placed the same way.
+  kind      String   @default("SIGNATURE") @db.VarChar(20)
+  /// The picture's own size in pixels, so a new element keeps its shape.
+  width     Int      @db.SmallInt
+  height    Int      @db.SmallInt
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@map("certificate_assets")
+}
+
+/// A certificate a student holds, or a teacher for a circle honoring: one of each template per holder and occasion.
+model IssuedCertificate {
+  id         String   @id @default(nanoid(32)) @db.VarChar(32)
+  /// The number printed on the certificate.
+  serial     Int      @unique @default(autoincrement())
+  templateId String   @map("template_id") @db.VarChar(32)
+  /// The holder: a student, or the teacher of an honored circle.
+  studentId  String   @map("student_id") @db.VarChar(32)
+  /// Null when the program issued it.
+  issuedById String?  @map("issued_by_id") @db.VarChar(32)
+  /// The reason the administration wrote, printed where the design asks for it.
+  note       String?  @db.VarChar(200)
+  /// The circle it honors. Its name and teacher are printed instead of the holder's current circle.
+  circleId   String?  @map("circle_id") @db.VarChar(32)
+  /// What it was given for, so a design can be given again on another occasion, like each month's honoring. Empty for one-time certificates.
+  occasion   String   @default("") @db.VarChar(60)
+  issuedAt   DateTime @default(now()) @map("issued_at") @db.Timestamptz
+
+  template CertificateTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  student  User                @relation("CertificateStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  issuedBy User?               @relation("CertificateIssuer", fields: [issuedById], references: [id], onDelete: SetNull)
+  circle   Circle?             @relation(fields: [circleId], references: [id], onDelete: SetNull)
+
+  @@unique([templateId, studentId, occasion])
+  @@index([studentId])
+  @@index([circleId])
+  @@map("issued_certificates")
+}
+
+// ---------- Support ----------
+
+enum SupportCategory {
+  TECHNICAL
+  ACCOUNT
+  PROGRAM
+  OTHER
+}
+
+enum SupportStatus {
+  OPEN
+  CLOSED
+}
+
+/// A conversation a student, teacher or supervisor opens with the administration's support staff.
+model SupportTicket {
+  id              String          @id @default(nanoid(32)) @db.VarChar(32)
+  requesterId     String          @map("requester_id") @db.VarChar(32)
+  subject         String          @db.VarChar(160)
+  category        SupportCategory @default(OTHER)
+  status          SupportStatus   @default(OPEN)
+  /// The support staff member handling it. Null while it waits for someone to take it.
+  assigneeId      String?         @map("assignee_id") @db.VarChar(32)
+  /// Messages the requester has not read yet: the support side's replies.
+  requesterUnread Int             @default(0) @map("requester_unread")
+  /// Messages the support side has not read yet: shared by every support staff member.
+  supportUnread   Int             @default(0) @map("support_unread")
+  lastMessageAt   DateTime        @default(now()) @map("last_message_at") @db.Timestamptz
+  closedAt        DateTime?       @map("closed_at") @db.Timestamptz
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime        @updatedAt @map("updated_at") @db.Timestamptz
+
+  requester User             @relation("SupportRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  assignee  User?            @relation("SupportAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  messages  SupportMessage[]
+
+  @@index([requesterId, lastMessageAt])
+  @@index([status, lastMessageAt])
+  @@index([assigneeId])
+  @@map("support_tickets")
+}
+
+model SupportMessage {
+  id          String   @id @default(nanoid(32)) @db.VarChar(32)
+  ticketId    String   @map("ticket_id") @db.VarChar(32)
+  /// Null once the author's account is deleted. fromSupport still says which side wrote it.
+  authorId    String?  @map("author_id") @db.VarChar(32)
+  fromSupport Boolean  @map("from_support")
+  body        String   @db.VarChar(4000)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author User?         @relation("SupportMessageAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+  @@map("support_messages")
 }
 
 /// What a student sees in the app's notifications. Push delivery can be added on top of this.

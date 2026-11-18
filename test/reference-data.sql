@@ -23,11 +23,11 @@ INSERT INTO "encouragement_messages" ("id", "text") VALUES
   (substr(md5('m4'), 1, 32), 'جعل الله القرآن شفيعًا لكِ'),
   (substr(md5('m5'), 1, 32), 'سيشهد لكِ القرآن يومًا');
 
-INSERT INTO "badges" ("id", "code", "label", "condition", "icon") VALUES
-  (substr(md5('b1'), 1, 32), 'dedication', 'همة عالية', 'المواظبة على الورد 30 يومًا متتالية', 'flame-outline'),
-  (substr(md5('b2'), 1, 32), 'mastery', 'متقنة', 'نسبة إتقان 90% في شهر', 'star-outline'),
-  (substr(md5('b3'), 1, 32), 'surahComplete', 'خاتمة سورة', 'اجتياز بوابة أي سورة', 'book-outline'),
-  (substr(md5('b4'), 1, 32), 'quranCompanion', 'صاحبة القرآن', 'إتمام المسار كاملًا', 'repeat');
+INSERT INTO "badges" ("id", "code", "label", "condition", "icon", "trigger", "threshold", "supervisor_can_award") VALUES
+  (substr(md5('b1'), 1, 32), 'dedication', 'همة عالية', 'المواظبة على الورد 30 يومًا متتالية', 'flame-outline', 'MANUAL', NULL, true),
+  (substr(md5('b2'), 1, 32), 'mastery', 'متقنة', 'نسبة إتقان 90% في شهر', 'star-outline', 'MANUAL', NULL, true),
+  (substr(md5('b3'), 1, 32), 'surahComplete', 'خاتمة سورة', 'اجتياز بوابة أي سورة', 'book-outline', 'SURAH_PASSED', 1, false),
+  (substr(md5('b4'), 1, 32), 'quranCompanion', 'صاحبة القرآن', 'إتمام المسار كاملًا', 'repeat', 'TRACK_COMPLETED', NULL, false);
 
 INSERT INTO "info_pages" ("slug", "title", "body", "updated_at") VALUES
   ('about', 'عن برنامج قمم', 'برنامج لحفظ القرآن الكريم وتدبره في حلقات تتابعها معلمات متخصصات.', now()),

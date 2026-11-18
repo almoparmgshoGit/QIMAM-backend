@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ApiError } from '../common/api-error.js';
+import { assertTrackFitsSection } from '../common/sections.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { PlanService } from '../program/plan.service.js';
 import {
@@ -17,7 +18,10 @@ const PROFILE_SELECT = {
   fullName: true,
   phone: true,
   country: true,
+  region: true,
+  city: true,
   ageBand: true,
+  section: true,
   trackTemplate: { select: { code: true } },
   trackStart: true,
   language: true,
@@ -47,14 +51,18 @@ export class UsersService {
 
     let trackTemplateId: string | undefined;
     if (changes.track) {
+      // The track is chosen after the admission test is passed, never before.
+      const student = await this.prisma.user.findUnique({ where: { id: userId }, select: { admissionStatus: true, section: true } });
+      if (student?.admissionStatus !== 'ACCEPTED') throw new ApiError(409, 'admission_pending');
       // Once work has begun the plan is built on its track, so moving is an administrator's decision.
       const plan = await this.prisma.studentPlan.findUnique({ where: { studentId: userId }, select: { completedUnits: true } });
       if (plan && plan.completedUnits > 0) throw new ApiError(409, 'plan_in_progress');
       const template = await this.prisma.trackTemplate.findUnique({
         where: { code: changes.track.trackId },
-        select: { id: true, active: true, kind: true },
+        select: { id: true, active: true, kind: true, recitationMode: true },
       });
       if (!template?.active || template.kind !== 'MEMORIZATION') throw new ApiError(409, 'track_closed');
+      assertTrackFitsSection(template.recitationMode, student.section);
       // A student stays on her circle's track. Moving means moving circle first.
       const membership = await this.prisma.circleMembership.findFirst({
         where: { studentId: userId, leftAt: null },

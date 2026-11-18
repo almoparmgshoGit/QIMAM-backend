@@ -31,7 +31,8 @@ export class OtpService {
    * registered. Delivery is not awaited, so its duration reveals nothing either.
    */
   async request(phone: string, purpose: OtpPurpose): Promise<void> {
-    const code = String(randomInt(CODE_MAX)).padStart(CODE_LENGTH, '0');
+    // When the provider makes the code, this server never sees it and stores no hash.
+    const code = this.delivery.providerIssuesCodes ? null : String(randomInt(CODE_MAX)).padStart(CODE_LENGTH, '0');
     const now = Date.now();
 
     await this.prisma.$transaction(async (tx) => {
@@ -60,7 +61,12 @@ export class OtpService {
         data: { consumedAt: new Date(now) },
       });
       await tx.otpChallenge.create({
-        data: { phone, purpose, codeHmac: this.hmac(phone, code), expiresAt: new Date(now + CODE_LIFETIME_MS) },
+        data: {
+          phone,
+          purpose,
+          codeHmac: code === null ? null : this.hmac(phone, code),
+          expiresAt: new Date(now + CODE_LIFETIME_MS),
+        },
       });
     });
 
@@ -86,9 +92,9 @@ export class OtpService {
     });
     if (counted.count !== 1) throw invalid;
 
-    const expected = Buffer.from(challenge.codeHmac, 'hex');
-    const actual = Buffer.from(this.hmac(phone, code), 'hex');
-    if (!timingSafeEqual(expected, actual)) throw invalid;
+    const correct =
+      challenge.codeHmac === null ? await this.checkWithProvider(phone, code) : this.matches(challenge.codeHmac, phone, code);
+    if (!correct) throw invalid;
 
     // A code signs in once, even if two requests carry it at the same moment.
     const consumed = await this.prisma.otpChallenge.updateMany({
@@ -96,6 +102,20 @@ export class OtpService {
       data: { consumedAt: new Date() },
     });
     if (consumed.count !== 1) throw invalid;
+  }
+
+  private matches(codeHmac: string, phone: string, code: string): boolean {
+    return timingSafeEqual(Buffer.from(codeHmac, 'hex'), Buffer.from(this.hmac(phone, code), 'hex'));
+  }
+
+  /** The attempt stays counted when the provider can't answer, so an outage can't be used to guess for free. */
+  private async checkWithProvider(phone: string, code: string): Promise<boolean> {
+    try {
+      return await this.delivery.check(phone, code);
+    } catch (error: unknown) {
+      this.logger.error(`Code check failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+      throw new ApiError(503, 'otp_unavailable');
+    }
   }
 
   private hmac(phone: string, code: string): string {

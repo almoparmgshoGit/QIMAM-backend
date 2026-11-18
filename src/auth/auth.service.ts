@@ -1,11 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { ApiError } from '../common/api-error.js';
+import { assertTrackFitsSection } from '../common/sections.js';
 import { Prisma } from '../generated/prisma/client.js';
 import type { AccountStatus, ConsentType, NotificationType, Role } from '../generated/prisma/enums.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { PlanService } from '../program/plan.service.js';
 import { SettingsService } from '../program/settings.service.js';
-import { toStabilizationStart, toTrackId } from '../users/profile.mapper.js';
+import { toSection, toStabilizationStart, toTrackId } from '../users/profile.mapper.js';
 import type { CompleteRegistrationDto, RegistrationDto, RequestOtpDto, VerifyOtpDto } from './auth.schemas.js';
 import { OtpService } from './otp.service.js';
 import { TokensService } from './tokens.service.js';
@@ -73,12 +74,19 @@ export class AuthService {
 
   private async createStudent(phone: string, registration: RegistrationDto) {
     const select = { id: true, role: true, status: true } as const;
-    // A stopped track takes no new students, whatever an old copy of the app sends.
-    const template = await this.prisma.trackTemplate.findUnique({
-      where: { code: registration.trackId },
-      select: { id: true, active: true, kind: true },
-    });
-    if (!template?.active || template.kind !== 'MEMORIZATION') throw new ApiError(409, 'track_closed');
+    const section = toSection(registration.section);
+    // A new student has no track until the admission test. An old copy of the app still sends one.
+    let template: { id: string } | null = null;
+    if (registration.trackId) {
+      // A stopped track takes no new students, whatever an old copy of the app sends.
+      const found = await this.prisma.trackTemplate.findUnique({
+        where: { code: registration.trackId },
+        select: { id: true, active: true, kind: true, recitationMode: true },
+      });
+      if (!found?.active || found.kind !== 'MEMORIZATION') throw new ApiError(409, 'track_closed');
+      assertTrackFitsSection(found.recitationMode, section);
+      template = found;
+    }
     // Acceptance is recorded against the wording in force now. The version rises when the wording changes.
     const [{ version }, admission] = await Promise.all([this.settings.get('pledges'), this.settings.get('admission')]);
     try {
@@ -88,9 +96,12 @@ export class AuthService {
             phone,
             fullName: registration.fullName,
             country: registration.country,
+            region: registration.region ?? null,
+            city: registration.city ?? null,
             ageBand: registration.ageBand,
-            trackId: toTrackId(registration.trackId),
-            trackTemplateId: template.id,
+            section,
+            trackId: registration.trackId ? toTrackId(registration.trackId) : null,
+            trackTemplateId: template?.id ?? null,
             trackStart: registration.trackStart ? toStabilizationStart(registration.trackStart) : null,
             admissionStatus: admission.required ? 'PENDING' : 'ACCEPTED',
             consents: { create: CONSENTS.map((type) => ({ type, version: String(version) })) },

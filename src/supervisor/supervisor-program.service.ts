@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import type { StaffActor } from '../auth/staff.decorators.js';
 import { ApiError } from '../common/api-error.js';
-import { attendanceRate, riyadhDate } from '../common/staff-api.js';
+import { ATTENDANCE_DAY, attendanceRate, riyadhDate } from '../common/staff-api.js';
 import type { AttendanceStatus } from '../generated/prisma/enums.js';
 import { AuditService } from '../prisma/audit.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
@@ -100,7 +100,7 @@ export class SupervisorProgramService {
     const sent = await this.notifications.send([studentId], {
       type: 'DAILY_WIRD',
       title: 'تذكير بوردك',
-      body: 'تأخر وردك عن خطتك. أعانك الله، ابدئي بما تيسر اليوم.',
+      body: 'تأخر وردك عن خطتك. أعانك الله، {{ابدأ|ابدئي}} بما تيسر اليوم.',
       dedupeKey: `reminder:${riyadhDate().toISOString().slice(0, 10)}`,
     });
     await this.audit.record(staff, 'student.remind', { type: 'student', id: studentId });
@@ -115,7 +115,7 @@ export class SupervisorProgramService {
       this.prisma.trackTemplate.findMany({
         where: { active: true },
         orderBy: { createdAt: 'asc' },
-        select: { id: true, name: true, kind: true, dailyUnit: true, duration: true },
+        select: { id: true, name: true, kind: true, dailyUnit: true, dailyAyahs: true, duration: true },
       }),
       this.prisma.circle.findMany({
         where: { scopeId, archivedAt: null },
@@ -165,6 +165,8 @@ export class SupervisorProgramService {
     const { passScore } = await this.settings.get('gate');
     const exams = await this.prisma.stageExam.findMany({
       where: {
+        // A review track's final test isn't a seventh.
+        finalKind: null,
         ...(filters.days ? { createdAt: { gte: new Date(Date.now() - filters.days * 24 * 60 * 60 * 1000) } } : {}),
         circle: {
           scopeId: this.scopeOf(staff),
@@ -220,8 +222,8 @@ export class SupervisorProgramService {
     };
   }
 
-  /** Surahs finished and their gates. */
-  async gateReport(staff: StaffActor, filters: { circleId?: string; teacherId?: string }) {
+  /** Surahs finished and their gates. With `days`, the passed and skipped count those decided in that time; waiting ones always count. */
+  async gateReport(staff: StaffActor, filters: { circleId?: string; teacherId?: string; days?: number }) {
     const circles = await this.prisma.circle.findMany({
       where: {
         scopeId: this.scopeOf(staff),
@@ -233,7 +235,10 @@ export class SupervisorProgramService {
     });
     const gates = await this.prisma.surahGate.groupBy({
       by: ['studentId', 'status'],
-      where: { studentId: { in: circles.flatMap((circle) => circle.memberships.map(({ studentId }) => studentId)) } },
+      where: {
+        studentId: { in: circles.flatMap((circle) => circle.memberships.map(({ studentId }) => studentId)) },
+        ...(filters.days ? { OR: [{ status: 'PENDING' }, { decidedAt: { gte: new Date(Date.now() - filters.days * 24 * 60 * 60 * 1000) } }] } : {}),
+      },
       _count: true,
       _avg: { score: true },
     });
@@ -256,7 +261,7 @@ export class SupervisorProgramService {
     const [attendance, recitations, tasks, sessions] = await Promise.all([
       this.prisma.evaluation.groupBy({
         by: ['circleId', 'attendance'],
-        where: { circleId: { in: ids }, createdAt: { gte: since }, attendance: { not: null } },
+        where: { circleId: { in: ids }, createdAt: { gte: since }, ...ATTENDANCE_DAY },
         _count: true,
       }),
       this.prisma.evaluation.groupBy({

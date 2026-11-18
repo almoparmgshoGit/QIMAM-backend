@@ -12,6 +12,9 @@ export const staffLoginSchema = z.strictObject({
 export type StaffLoginDto = z.infer<typeof staffLoginSchema>;
 
 export const mfaTokenSchema = z.strictObject({ mfaToken: jwtToken });
+
+export const impersonationTicketSchema = z.strictObject({ ticket: jwtToken });
+export type ImpersonationTicketDto = z.infer<typeof impersonationTicketSchema>;
 export type MfaTokenDto = z.infer<typeof mfaTokenSchema>;
 
 export const mfaCodeSchema = z.strictObject({ mfaToken: jwtToken, code: totpCode });

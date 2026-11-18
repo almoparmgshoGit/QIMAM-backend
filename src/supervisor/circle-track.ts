@@ -1,4 +1,5 @@
 import { ApiError } from '../common/api-error.js';
+import { assertStudentSectionFits } from '../common/sections.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
 
 const OPEN_TRANSFER = ['PENDING_ADMIN', 'PENDING_TEACHER'] as const;
@@ -11,6 +12,7 @@ export async function assertStudentFitsCircle(prisma: PrismaService, circleId: s
   ]);
   if (!circle?.trackTemplateId) throw new ApiError(409, 'circle_has_no_track');
   if (student?.trackTemplateId !== circle.trackTemplateId) throw new ApiError(409, 'track_mismatch');
+  await assertStudentSectionFits(prisma, circleId, studentId);
 }
 
 /** A circle can't move to a track while a student in it, or on her way to it, is on another. */

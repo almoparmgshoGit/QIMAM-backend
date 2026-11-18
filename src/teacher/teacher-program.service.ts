@@ -1,14 +1,17 @@
 import { Injectable } from '@nestjs/common';
 import type { StaffActor } from '../auth/staff.decorators.js';
 import { ApiError } from '../common/api-error.js';
-import { riyadhDate } from '../common/staff-api.js';
+import { ATTENDANCE_DAY, riyadhDate } from '../common/staff-api.js';
 import { SURAH_PAGES } from '../common/mushaf.js';
+import { findSurah } from '../common/surahs.js';
 import { AuditService } from '../prisma/audit.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { NotificationsService } from '../program/notifications.service.js';
 import { buildUnits, DAY_MS, unitLabel } from '../program/plan-engine.js';
 import { PlanService } from '../program/plan.service.js';
 import { SettingsService } from '../program/settings.service.js';
+import { StageExamService } from '../program/stage-exam.service.js';
+import { examLabel } from '../program/review-rules.js';
 import { announcementStatus } from '../supervisor/supervisor-program.service.js';
 
 const WEEKS_IN_CHART = 4;
@@ -23,6 +26,7 @@ export class TeacherProgramService {
     private readonly settings: SettingsService,
     private readonly audit: AuditService,
     private readonly notifications: NotificationsService,
+    private readonly stageExams: StageExamService,
   ) {}
 
   async listGates(teacher: StaffActor) {
@@ -53,7 +57,7 @@ export class TeacherProgramService {
     await this.notifications.send([gate.studentId], {
       type: 'EVALUATION',
       title: 'اعتُمدت البوابة',
-      body: 'فُتحت لكِ السورة التالية. بارك الله فيك.',
+      body: 'فُتحت {{لك|لكِ}} السورة التالية. بارك الله فيك.',
       dedupeKey: `gate-pass:${gate.id}`,
     });
   }
@@ -63,8 +67,8 @@ export class TeacherProgramService {
     await this.plans.returnGate(teacher, gate, note);
     await this.notifications.send([gate.studentId], {
       type: 'EVALUATION',
-      title: 'أعادت معلمتك البوابة',
-      body: note ?? 'أعيدي التغليف ثم الاختبار.',
+      title: '{{أعاد معلمك|أعادت معلمتك}} البوابة',
+      body: note ?? '{{أعد|أعيدي}} التغليف ثم الاختبار.',
     });
   }
 
@@ -117,7 +121,7 @@ export class TeacherProgramService {
   async decideSkipRequest(teacher: StaffActor, id: string, approve: boolean): Promise<void> {
     const request = await this.prisma.skipRequest.findFirst({
       where: { id, status: 'PENDING', student: this.inTeacherCircle(teacher.id) },
-      select: { id: true, studentId: true, surah: true },
+      select: { id: true, studentId: true, surah: true, request: true },
     });
     if (!request) throw notFound();
 
@@ -129,6 +133,47 @@ export class TeacherProgramService {
     });
     if (count !== 1) throw new ApiError(409, 'invalid_request_state');
     await this.audit.record(teacher, approve ? 'skip.approve' : 'skip.reject', { type: 'student', id: request.studentId }, { surah: request.surah });
+    await this.notifications.send([request.studentId], {
+      type: 'EVALUATION',
+      title: approve ? '{{وافق معلمك|وافقت معلمتك}} على طلبك' : '{{اعتذر معلمك|اعتذرت معلمتك}} عن طلبك',
+      body: request.request,
+      dedupeKey: `request-decision:${request.id}`,
+    });
+  }
+
+  /** What the teacher can do with the student's position: skip the current surah, or go back to an earlier one. */
+  async planActions(teacher: StaffActor, studentId: string) {
+    await this.memberOrThrow(teacher.id, studentId);
+    const [summaries, rewindable] = await Promise.all([this.plans.summaries([studentId]), this.plans.rewindableSurahs(studentId)]);
+    const summary = summaries.get(studentId);
+    const current = summary && summary.status !== 'no_plan' && summary.status !== 'completed' ? summary.currentSurah : null;
+    return {
+      currentSurah: current && { surah: current, name: findSurah(current)?.name ?? null },
+      rewindable: rewindable.map((surah) => ({ surah, name: findSurah(surah)?.name ?? null })),
+    };
+  }
+
+  /** Approves passing the current surah, as an approved skip request would: its next surah opens. */
+  async skipSurah(teacher: StaffActor, studentId: string): Promise<void> {
+    const { currentSurah } = await this.planActions(teacher, studentId);
+    if (!currentSurah) throw new ApiError(409, 'no_current_surah');
+    await this.plans.skipCurrentSurah(teacher, studentId, currentSurah.surah);
+    await this.audit.record(teacher, 'skip.approve', { type: 'student', id: studentId }, { surah: currentSurah.surah });
+    await this.notifications.send([studentId], {
+      type: 'EVALUATION',
+      title: '{{اعتمد معلمك|اعتمدت معلمتك}} تجاوز السورة',
+      body: `فُتحت {{لك|لكِ}} السورة التي بعد ${currentSurah.name ?? currentSurah.surah}.`,
+    });
+  }
+
+  async rewind(teacher: StaffActor, studentId: string, surah: number): Promise<void> {
+    await this.memberOrThrow(teacher.id, studentId);
+    await this.plans.rewindToSurah(teacher, studentId, surah);
+    await this.notifications.send([studentId], {
+      type: 'EVALUATION',
+      title: '{{أعادك معلمك|أعادتك معلمتك}} إلى سورة سابقة',
+      body: `{{ابدأ|ابدئي}} من جديد من سورة ${findSurah(surah)?.name ?? surah} حتى تتقنها.`,
+    });
   }
 
   async recordStageExam(teacher: StaffActor, dto: { studentId: string; stage: number; score: number }) {
@@ -151,10 +196,11 @@ export class TeacherProgramService {
       select: { id: true, passed: true },
     });
     await this.audit.record(teacher, 'stage_exam.create', { type: 'student', id: dto.studentId }, { stage: dto.stage, score: dto.score });
+    if (exam.passed && dto.stage <= 7) await this.stageExams.settledByHand(dto.studentId, dto.stage);
     await this.notifications.send([dto.studentId], {
       type: 'EVALUATION',
       title: 'نتيجة الاختبار المرحلي',
-      body: `المرحلة ${dto.stage}: ${dto.score} من 10 · ${exam.passed ? 'ناجحة' : 'تحتاجين إلى إعادة الاختبار'}`,
+      body: `المرحلة ${dto.stage}: ${dto.score} من 10 · ${exam.passed ? 'ناجحة' : '{{تحتاج|تحتاجين}} إلى إعادة الاختبار'}`,
       dedupeKey: `stage-exam:${exam.id}`,
     });
     return exam;
@@ -167,13 +213,13 @@ export class TeacherProgramService {
         where: { teacherId: teacher.id },
         orderBy: { createdAt: 'desc' },
         take: 100,
-        select: { id: true, stage: true, score: true, passed: true, createdAt: true, student: { select: { id: true, fullName: true } } },
+        select: { id: true, stage: true, finalKind: true, score: true, passed: true, createdAt: true, student: { select: { id: true, fullName: true } } },
       }),
       this.settings.get('gate'),
     ]);
     return {
       passScore: gate.passScore,
-      items: rows.map(({ student, score, ...row }) => ({ ...row, score: Number(score), student: { id: student.id, name: student.fullName } })),
+      items: rows.map(({ student, score, ...row }) => ({ ...row, label: examLabel(row.stage, row.finalKind), score: Number(score), student: { id: student.id, name: student.fullName } })),
     };
   }
 
@@ -219,14 +265,23 @@ export class TeacherProgramService {
     });
     if (!membership) throw notFound();
     const { openRecord } = await this.settings.get('permissions');
-    const circleLimit = openRecord ? {} : { circleId: membership.circleId };
+    return this.recordOf(studentId, membership.circleId, !openRecord);
+  }
+
+  /**
+   * Callers check access first. The tasks are those of the given circle, and with `onlyThatCircle`
+   * the recitations, exams and attendance are too.
+   */
+  async recordOf(studentId: string, circleId: string | null, onlyThatCircle: boolean) {
+    const circleLimit = onlyThatCircle && circleId ? { circleId } : {};
 
     const [plan, days, recitations, exams, attendance, tasks] = await Promise.all([
       this.prisma.studentPlan.findUnique({
         where: { studentId },
         select: {
           surahOrder: true,
-          template: { select: { dailyUnit: true } },
+          pageRange: true,
+          template: { select: { dailyUnit: true, dailyAyahs: true } },
           logs: { orderBy: { doneOn: 'desc' }, take: 100, select: { unitIndex: true, source: true, doneOn: true } },
         },
       }),
@@ -235,21 +290,21 @@ export class TeacherProgramService {
         where: { studentId, surah: { not: null }, ...circleLimit },
         orderBy: { createdAt: 'desc' },
         take: 100,
-        select: { id: true, title: true, score: true, maxScore: true, comment: true, segmentStatus: true, attendance: true, createdAt: true },
+        select: { id: true, teacherId: true, title: true, score: true, maxScore: true, comment: true, segmentStatus: true, attendance: true, createdAt: true },
       }),
       this.prisma.stageExam.findMany({
         where: { studentId, ...circleLimit },
         orderBy: { createdAt: 'desc' },
-        select: { id: true, stage: true, score: true, passed: true, createdAt: true },
+        select: { id: true, stage: true, finalKind: true, score: true, passed: true, createdAt: true },
       }),
       this.prisma.evaluation.findMany({
-        where: { studentId, attendance: { not: null }, ...circleLimit },
-        orderBy: { createdAt: 'desc' },
+        where: { studentId, ...ATTENDANCE_DAY, ...circleLimit },
+        orderBy: { attendanceOn: 'desc' },
         take: 60,
         select: { id: true, attendance: true, title: true, createdAt: true },
       }),
       this.prisma.task.findMany({
-        where: { circleId: membership.circleId, archivedAt: null, OR: [{ studentId: null }, { studentId }] },
+        where: circleId ? { circleId, archivedAt: null, OR: [{ studentId: null }, { studentId }] } : { studentId, archivedAt: null },
         orderBy: { createdAt: 'desc' },
         take: 50,
         select: {
@@ -263,7 +318,7 @@ export class TeacherProgramService {
     ]);
 
     const dailyUnit = plan?.template.dailyUnit;
-    const units = dailyUnit ? buildUnits(dailyUnit, plan.surahOrder) : [];
+    const units = dailyUnit ? buildUnits(dailyUnit, plan.surahOrder, plan.pageRange, plan.template.dailyAyahs) : [];
     const today = riyadhDate().getTime();
     return {
       memorized: (plan?.logs ?? []).flatMap(({ unitIndex, source, doneOn }) => {
@@ -277,7 +332,7 @@ export class TeacherProgramService {
         maxScore: Number(maxScore),
         note: comment,
       })),
-      stageExams: exams.map(({ score, ...row }) => ({ ...row, score: Number(score) })),
+      stageExams: exams.map(({ score, ...row }) => ({ ...row, label: examLabel(row.stage, row.finalKind), score: Number(score) })),
       attendance,
       tasks: tasks.map(({ completions, ...task }) => {
         const last = completions[0]?.dueOn ?? null;
@@ -294,7 +349,8 @@ export class TeacherProgramService {
       where: { student: this.inTeacherCircle(teacher.id) },
       select: {
         surahOrder: true,
-        template: { select: { name: true, dailyUnit: true } },
+        pageRange: true,
+        template: { select: { name: true, dailyUnit: true, dailyAyahs: true } },
         logs: { where: { doneOn: { gte: since } }, select: { doneOn: true, unitIndex: true } },
       },
     });
@@ -303,13 +359,13 @@ export class TeacherProgramService {
     const result = new Map<string, number[]>();
     for (const plan of plans) {
       const weeks = result.get(plan.template.name) ?? blankWeeks();
-      const pageSize = plan.template.dailyUnit === 'HALF_PAGE' ? 0.5 : plan.template.dailyUnit === 'PAGE' ? 1 : null;
+      const dailyUnit = plan.template.dailyUnit;
+      const units = dailyUnit ? buildUnits(dailyUnit, plan.surahOrder, plan.pageRange, plan.template.dailyAyahs) : [];
       for (const log of plan.logs) {
         const week = WEEKS_IN_CHART - 1 - Math.floor((now - log.doneOn.getTime()) / (7 * DAY_MS));
         if (week < 0 || week >= WEEKS_IN_CHART) continue;
-        // A surah-by-surah unit is as long as its surah.
-        const size = pageSize ?? SURAH_PAGES[plan.surahOrder[log.unitIndex]]?.length ?? 0;
-        weeks[week] += size;
+        // A surah-by-surah unit is as long as the part of its surah in the plan.
+        weeks[week] += units[log.unitIndex]?.pages ?? 0;
       }
       result.set(plan.template.name, weeks);
     }
@@ -340,6 +396,14 @@ export class TeacherProgramService {
       memorized: result.get(track) ?? blankWeeks(),
       reviewed: reviewed.get(track) ?? blankWeeks(),
     }));
+  }
+
+  private async memberOrThrow(teacherId: string, studentId: string): Promise<void> {
+    const member = await this.prisma.circleMembership.findFirst({
+      where: { studentId, leftAt: null, circle: { teacherId, archivedAt: null } },
+      select: { id: true },
+    });
+    if (!member) throw notFound();
   }
 
   private inTeacherCircle(teacherId: string) {

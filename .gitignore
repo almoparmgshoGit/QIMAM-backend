@@ -1,4 +1,7 @@
 node_modules/
+
+# Uploaded files: badge pictures, certificate backgrounds and recordings
+uploads/
 dist/
 coverage/
 

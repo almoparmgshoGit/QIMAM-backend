@@ -1,5 +1,6 @@
-import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
-import { CurrentStaff, Dashboard, Roles, type StaffActor } from '../auth/staff.decorators.js';
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
+import { ANY_EMPLOYEE } from '../auth/permissions.js';
+import { CurrentStaff, Dashboard, Permissions, Roles, type StaffActor } from '../auth/staff.decorators.js';
 import { idSchema } from '../common/staff-api.js';
 import {
   type CreateAdminCircleDto,
@@ -20,18 +21,19 @@ import {
   scopeSchema,
   type UpdateStaffDto,
   updateStaffSchema,
-  type UpdateStudentDto,
-  updateStudentSchema,
 } from './admin.schemas.js';
 import { AdminService } from './admin.service.js';
 
 @Dashboard()
 @Roles('ADMIN')
+@Permissions('accounts.manage')
 @Controller('admin')
 export class AdminController {
   constructor(private readonly admin: AdminService) {}
 
+  // Other pages pick a teacher or name an actor from this list.
   @Get('staff')
+  @Permissions('accounts.manage', 'audit.view', 'motivation.manage')
   listStaff(@Query({ schema: listStaffSchema }) query: ListStaffDto) {
     return this.admin.listStaff(query);
   }
@@ -50,6 +52,12 @@ export class AdminController {
     return this.admin.updateStaff(staff, id, body);
   }
 
+  @Delete('staff/:id')
+  @HttpCode(204)
+  async deleteStaff(@CurrentStaff() staff: StaffActor, @Param('id', { schema: idSchema }) id: string) {
+    await this.admin.deleteStaff(staff, id);
+  }
+
   @Post('staff/:id/reset-credentials')
   @HttpCode(200)
   resetStaffCredentials(@CurrentStaff() staff: StaffActor, @Param('id', { schema: idSchema }) id: string) {
@@ -57,6 +65,7 @@ export class AdminController {
   }
 
   @Get('scopes')
+  @Permissions(ANY_EMPLOYEE)
   listScopes() {
     return this.admin.listScopes();
   }
@@ -75,24 +84,17 @@ export class AdminController {
     return this.admin.renameScope(staff, id, body.name);
   }
 
+  // Other pages pick students from this list.
   @Get('students')
+  @Permissions('students.manage', 'accounts.manage', 'certificates.manage', 'gates.manage')
   listStudents(@Query({ schema: listStudentsSchema }) query: ListStudentsDto) {
     return this.admin.listStudents(query);
   }
 
   @Post('students')
+  @Permissions('students.manage')
   createStudent(@CurrentStaff() staff: StaffActor, @Body({ schema: createStudentSchema }) body: CreateStudentDto) {
     return this.admin.createStudent(staff, body);
-  }
-
-  @Patch('students/:id')
-  @HttpCode(204)
-  async setStudentStatus(
-    @CurrentStaff() staff: StaffActor,
-    @Param('id', { schema: idSchema }) id: string,
-    @Body({ schema: updateStudentSchema }) body: UpdateStudentDto,
-  ) {
-    await this.admin.setStudentStatus(staff, id, body.status);
   }
 
   @Get('transfers')
@@ -113,6 +115,7 @@ export class AdminController {
   }
 
   @Get('circles')
+  @Permissions(ANY_EMPLOYEE)
   listCircles() {
     return this.admin.listCircles();
   }
@@ -123,6 +126,7 @@ export class AdminController {
   }
 
   @Get('audit')
+  @Permissions('audit.view')
   listAudit(@Query({ schema: listAuditSchema }) query: ListAuditDto) {
     return this.admin.listAudit(query);
   }

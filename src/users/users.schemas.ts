@@ -46,3 +46,12 @@ export const updateProfileSchema = z
   .refine((changes) => changes.track !== undefined || changes.preferences !== undefined, 'nothing to update');
 
 export type UpdateProfileDto = z.infer<typeof updateProfileSchema>;
+
+/** An Expo push token, such as ExponentPushToken[xxxxxxxx]. */
+const pushTokenSchema = z.string().regex(/^Expo(nent)?PushToken\[[A-Za-z0-9_-]{10,}\]$/, 'not an Expo push token');
+
+export const pushDeviceSchema = z.strictObject({ pushToken: pushTokenSchema, platform: z.enum(['ios', 'android']) });
+export type PushDeviceDto = z.infer<typeof pushDeviceSchema>;
+
+export const removePushDeviceSchema = z.strictObject({ pushToken: pushTokenSchema });
+export type RemovePushDeviceDto = z.infer<typeof removePushDeviceSchema>;

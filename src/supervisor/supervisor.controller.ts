@@ -119,6 +119,16 @@ export class SupervisorController {
     return this.supervisor.teacherActivity(staff, id);
   }
 
+  @Get('students/:id')
+  studentFile(@CurrentStaff() staff: StaffActor, @Param('id', { schema: idSchema }) id: string) {
+    return this.supervisor.studentFile(staff, id);
+  }
+
+  @Get('students/:id/record')
+  studentRecord(@CurrentStaff() staff: StaffActor, @Param('id', { schema: idSchema }) id: string) {
+    return this.supervisor.studentRecord(staff, id);
+  }
+
   @Get('distribution')
   distribution(@CurrentStaff() staff: StaffActor) {
     return this.supervisor.distribution(staff);

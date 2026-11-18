@@ -1,8 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
+import { forSection, hasAlternatives } from '../common/sections.js';
+import { examLabel } from './review-rules.js';
+import { ATTENDANCE_DAY } from '../common/staff-api.js';
+import { isSupportKey, supportTicketOf } from '../common/support-keys.js';
 import type { NotificationType } from '../generated/prisma/enums.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { absenceLevel, DAY_MS } from './plan-engine.js';
+import { PushService } from './push.service.js';
 import { SettingsService } from './settings.service.js';
 
 export type Audience =
@@ -19,8 +24,8 @@ const ENCOURAGEMENT_MINUTES = 9 * 60;
 const LOOK_BACK_MS = 2 * DAY_MS;
 
 const ABSENCE_MESSAGES: Record<1 | 2 | 3, { title: string; body: string }> = {
-  1: { title: 'بنيتنا، افتقدنا حضورك', body: 'نسأل الله أن تكوني بخير، وننتظر عودتك إلى حلقتك.' },
-  2: { title: 'طالت غيبتك', body: 'تكرر غيابك عن الحلقة، فبادري بالعودة والتواصل مع معلمتك.' },
+  1: { title: '{{بنينا|بنيتنا}}، افتقدنا حضورك', body: 'نسأل الله أن {{تكون|تكوني}} بخير، وننتظر عودتك إلى حلقتك.' },
+  2: { title: 'طالت غيبتك', body: 'تكرر غيابك عن الحلقة، {{فبادر|فبادري}} بالعودة والتواصل مع {{معلمك|معلمتك}}.' },
   3: { title: 'إنذار لكثرة التسيب', body: 'كثر غيابك عن الحلقة، وقد يؤثر ذلك في بقائك في البرنامج.' },
 };
 
@@ -87,6 +92,7 @@ export class NotificationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly settings: SettingsService,
+    private readonly push: PushService,
   ) {}
 
   /** Active students in the audience. A student's own notification settings apply in send(). */
@@ -104,7 +110,7 @@ export class NotificationsService {
     return rows.map(({ id }) => id);
   }
 
-  /** Stores what each person sees in the app, and returns how many it reached. */
+  /** Stores what each person sees in the app, pushes it to their phones, and returns how many it reached. */
   async send(userIds: string[], message: Message): Promise<number> {
     if (userIds.length === 0) return 0;
     const optedOut = await this.prisma.notificationPreference.findMany({
@@ -112,11 +118,36 @@ export class NotificationsService {
       select: { userId: true },
     });
     const skip = new Set(optedOut.map(({ userId }) => userId));
-    const data = userIds.filter((id) => !skip.has(id)).map((userId) => ({ userId, ...message }));
-    if (data.length === 0) return 0;
-    // The dedupe key means a repeat of the same message to the same person does nothing.
-    const { count } = await this.prisma.notification.createMany({ data, skipDuplicates: true });
-    return count;
+    const recipients = userIds.filter((id) => !skip.has(id));
+    if (recipients.length === 0) return 0;
+    // Each reader gets the wording of her own section.
+    const gendered = hasAlternatives(message.title) || hasAlternatives(message.body);
+    const sections = gendered
+      ? new Map(
+          (await this.prisma.user.findMany({ where: { id: { in: recipients } }, select: { id: true, section: true } })).map(
+            ({ id, section }) => [id, section],
+          ),
+        )
+      : null;
+    const data = recipients.map((userId) => {
+      const section = sections?.get(userId) ?? 'WOMEN';
+      return sections
+        ? { userId, ...message, title: forSection(message.title, section), body: forSection(message.body, section) }
+        : { userId, ...message };
+    });
+    // The dedupe key means a repeat of the same message to the same person does nothing, so it is never pushed twice.
+    const created = await this.prisma.notification.createManyAndReturn({
+      data,
+      skipDuplicates: true,
+      select: { id: true, userId: true, type: true, title: true, body: true, dedupeKey: true },
+    });
+    const pushes = created.map(({ dedupeKey, ...row }) => {
+      const ticketId = supportTicketOf(dedupeKey);
+      return { ...row, opens: ticketId ? { opens: 'support', ticketId } : null };
+    });
+    // Not awaited: a slow push service must not hold up the request or the reminder job.
+    void this.push.deliver(pushes).catch(() => undefined);
+    return created.length;
   }
 
   /** Tells the teacher of the student's current circle, if there is one. */
@@ -126,6 +157,55 @@ export class NotificationsService {
       select: { circle: { select: { teacherId: true } } },
     });
     if (membership?.circle.teacherId) await this.send([membership.circle.teacherId], message);
+  }
+
+  /** A transfer now waits on the receiving teacher: she hears of it. */
+  async transferAwaitsTeacher(transferId: string): Promise<void> {
+    const transfer = await this.prisma.transferRequest.findUnique({
+      where: { id: transferId },
+      select: { status: true, toCircle: { select: { name: true, teacherId: true } } },
+    });
+    if (transfer?.status !== 'PENDING_TEACHER' || !transfer.toCircle.teacherId) return;
+    await this.send([transfer.toCircle.teacherId], {
+      type: 'GENERAL',
+      title: '{{طالب منقول|طالبة منقولة}} بانتظار قبولك',
+      body: `إلى حلقة ${transfer.toCircle.name}. {{افتح|افتحي}} «الاعتماد والطلبات» للقبول أو الاعتذار.`,
+      dedupeKey: `transfer-pending:${transferId}`,
+    });
+  }
+
+  /** The teacher decided: whoever asked for the transfer hears the result, and an accepted student hears of her new circle. */
+  async transferDecided(transferId: string, accepted: boolean): Promise<void> {
+    const transfer = await this.prisma.transferRequest.findUnique({
+      where: { id: transferId },
+      select: { studentId: true, requestedById: true, student: { select: { fullName: true } }, toCircle: { select: { name: true } } },
+    });
+    if (!transfer) return;
+    if (transfer.requestedById) {
+      await this.send([transfer.requestedById], {
+        type: 'GENERAL',
+        title: accepted ? 'قُبل النقل' : 'رُفض النقل',
+        body: `${transfer.student.fullName} · حلقة ${transfer.toCircle.name}`,
+        dedupeKey: `transfer-decided:${transferId}`,
+      });
+    }
+    if (accepted) {
+      await this.send([transfer.studentId], {
+        type: 'GENERAL',
+        title: '{{انتقلت|انتقلتِ}} إلى حلقة جديدة',
+        body: `حلقتك الآن ${transfer.toCircle.name}.`,
+        dedupeKey: `transfer-moved:${transferId}`,
+      });
+    }
+  }
+
+  /** Tells the active supervisors of a scope. */
+  async notifySupervisorsOf(scopeId: string, message: Message): Promise<void> {
+    const supervisors = await this.prisma.user.findMany({
+      where: { role: 'SUPERVISOR', status: 'ACTIVE', scopeId },
+      select: { id: true },
+    });
+    if (supervisors.length > 0) await this.send(supervisors.map(({ id }) => id), message);
   }
 
   async inbox(userId: string) {
@@ -143,7 +223,19 @@ export class NotificationsService {
       items: items.map(({ dedupeKey, ...item }) => ({
         ...item,
         /** The dashboard page this notice is about, under the role's own path. */
-        opens: dedupeKey?.startsWith('task-done') ? 'tasks' : dedupeKey?.startsWith('gate-ready') || dedupeKey?.startsWith('request') ? 'approvals' : null,
+        opens: dedupeKey?.startsWith('task-done')
+          ? 'tasks'
+          : dedupeKey?.startsWith('gate-ready') || dedupeKey?.startsWith('request')
+            ? 'approvals'
+            : dedupeKey?.startsWith('honor-certificate')
+              ? 'certificates'
+              : dedupeKey?.startsWith('stage-exam')
+                ? 'stage-exams'
+                : isSupportKey(dedupeKey)
+                  ? 'support'
+                  : null,
+        /** The support conversation it opens, when it is about one. */
+        ticketId: supportTicketOf(dedupeKey),
       })),
     };
   }
@@ -186,6 +278,28 @@ export class NotificationsService {
         body: `خلال ساعتين: ${session.title}`,
         dedupeKey: `session-soon:${session.id}`,
       });
+    }
+
+    // A stage exam reminds both of its two people.
+    const exams = await this.prisma.stageExamSession.findMany({
+      where: { status: 'SCHEDULED', scheduledAt: { gt: now, lte: new Date(now.getTime() + SESSION_NOTICE_MS) } },
+      select: { id: true, studentId: true, examinerId: true, stage: true, finalKind: true, student: { select: { fullName: true } } },
+    });
+    for (const exam of exams) {
+      await this.send([exam.studentId], {
+        type: 'EVALUATION',
+        title: exam.finalKind ? 'يقترب موعد اختبارك' : 'يقترب اختبارك المرحلي',
+        body: `خلال ساعتين: ${examLabel(exam.stage, exam.finalKind)}`,
+        dedupeKey: `stage-exam-soon:${exam.id}`,
+      });
+      if (exam.examinerId) {
+        await this.send([exam.examinerId], {
+          type: 'GENERAL',
+          title: exam.finalKind ? 'يقترب موعد اختبار' : 'يقترب اختبار مرحلي',
+          body: `خلال ساعتين: ${exam.student.fullName} · ${examLabel(exam.stage, exam.finalKind)}`,
+          dedupeKey: `stage-exam-soon:${exam.id}`,
+        });
+      }
     }
   }
 
@@ -250,7 +364,7 @@ export class NotificationsService {
     return this.sendByLocalDate(due, (date) => ({
       type: 'WEEKLY_REVIEW',
       title: 'تذكير بالمراجعة الأسبوعية',
-      body: 'اليوم يوم مراجعة، فاكتبي سور مراجعتك وعوّضي ما فاتك.',
+      body: 'اليوم يوم مراجعة، {{فاكتب|فاكتبي}} سور مراجعتك {{وعوّض|وعوّضي}} ما فاتك.',
       dedupeKey: `review:${date}`,
     }));
   }
@@ -284,13 +398,49 @@ export class NotificationsService {
   }
 
   /**
+   * Sends one incentive from the administration to its teachers. Claiming the row first means
+   * two runs at once, or a request and the job, never send it twice. Returns null if it was already sent.
+   */
+  async sendTeacherIncentive(id: string, now = new Date()): Promise<number | null> {
+    const { count } = await this.prisma.teacherIncentive.updateMany({ where: { id, sentAt: null }, data: { sentAt: now } });
+    if (count !== 1) return null;
+    const incentive = await this.prisma.teacherIncentive.findUniqueOrThrow({
+      where: { id },
+      select: { title: true, body: true, teacherId: true },
+    });
+    const teachers = await this.prisma.user.findMany({
+      where: { role: 'TEACHER', status: 'ACTIVE', ...(incentive.teacherId ? { id: incentive.teacherId } : {}) },
+      select: { id: true },
+    });
+    const recipients = await this.send(
+      teachers.map((teacher) => teacher.id),
+      { type: 'ENCOURAGEMENT', title: incentive.title, body: incentive.body, dedupeKey: `teacher-incentive:${id}` },
+    );
+    await this.prisma.teacherIncentive.update({ where: { id }, data: { recipients } });
+    return recipients;
+  }
+
+  /** Scheduled teacher incentives whose time has come. */
+  @Cron('* * * * *')
+  async sendDueTeacherIncentives(now = new Date()): Promise<number> {
+    const due = await this.prisma.teacherIncentive.findMany({
+      where: { sentAt: null, sendAt: { lte: now } },
+      orderBy: { sendAt: 'asc' },
+      select: { id: true },
+    });
+    let reached = 0;
+    for (const { id } of due) reached += (await this.sendTeacherIncentive(id, now)) ?? 0;
+    return reached;
+  }
+
+  /**
    * Called when attendance is recorded. Each warning is sent once, and a higher level sends its own.
    * Attending again closes the warnings, so a later run of absences starts from the beginning.
    */
   async checkAbsence(studentId: string): Promise<void> {
     const rows = await this.prisma.evaluation.findMany({
-      where: { studentId, attendance: { not: null }, createdAt: { gte: new Date(Date.now() - 30 * DAY_MS) } },
-      orderBy: { createdAt: 'desc' },
+      where: { studentId, ...ATTENDANCE_DAY, createdAt: { gte: new Date(Date.now() - 30 * DAY_MS) } },
+      orderBy: { attendanceOn: 'desc' },
       select: { attendance: true },
     });
     const level = absenceLevel(rows.flatMap(({ attendance }) => (attendance ? [attendance] : [])));

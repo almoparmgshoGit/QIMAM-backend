@@ -1,7 +1,7 @@
 import { createHash, createPrivateKey, createPublicKey, type KeyObject, randomBytes } from 'node:crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { decodeProtectedHeader, jwtVerify, SignJWT } from 'jose';
+import { decodeProtectedHeader, type JWTPayload, jwtVerify, SignJWT } from 'jose';
 import { ApiError } from '../common/api-error.js';
 import { randomId } from '../common/ids.js';
 import type { TokenAudience } from '../generated/prisma/enums.js';
@@ -31,6 +31,26 @@ const REGISTRATION_TOKEN_SECONDS = 30 * 60;
 const MFA_TOKEN_TYPE = 'mfa+jwt';
 const MFA_AUDIENCE = 'qimam-mfa';
 const MFA_TOKEN_SECONDS = 5 * 60;
+
+const IMPERSONATION_TOKEN_TYPE = 'impersonation+jwt';
+const IMPERSONATION_AUDIENCE = 'qimam-impersonation';
+// One sitting. It has no refresh: when it ends, the admin opens the account again.
+export const IMPERSONATION_TOKEN_SECONDS = 60 * 60;
+
+const IMPERSONATION_TICKET_TYPE = 'impersonation-ticket+jwt';
+const IMPERSONATION_TICKET_AUDIENCE = 'qimam-impersonation-ticket';
+// Long enough to open a private window and paste the link.
+export const IMPERSONATION_TICKET_SECONDS = 3 * 60;
+
+/** An admin signed in as a teacher or supervisor. */
+export interface ImpersonationClaims {
+  /** The account being used. */
+  userId: string;
+  /** The admin using it. */
+  actorId: string;
+  /** The admin's own dashboard session. Ending it ends this too. */
+  familyId: string;
+}
 
 export interface TokenPair {
   accessToken: string;
@@ -81,6 +101,81 @@ export class TokensService {
 
   verifyMfaToken(token: string): Promise<string> {
     return this.verifySubject(token, MFA_AUDIENCE, MFA_TOKEN_TYPE, 'invalid_mfa_token');
+  }
+
+  /**
+   * Lets an admin act as a teacher or supervisor in one browser window. It is sent as a bearer header, never a cookie,
+   * so it lives only in that window and leaves the admin's own session untouched.
+   */
+  issueImpersonationToken({ userId, actorId, familyId }: ImpersonationClaims): Promise<string> {
+    return this.sign(userId, IMPERSONATION_AUDIENCE, IMPERSONATION_TOKEN_TYPE, IMPERSONATION_TOKEN_SECONDS, {
+      act: { sub: actorId },
+      fam: familyId,
+    });
+  }
+
+  async verifyImpersonationToken(token: string): Promise<ImpersonationClaims> {
+    const payload = await this.verifyPayload(token, IMPERSONATION_AUDIENCE, IMPERSONATION_TOKEN_TYPE, 'invalid_token');
+    const actorId = (payload.act as { sub?: unknown } | undefined)?.sub;
+    if (typeof actorId !== 'string' || typeof payload.fam !== 'string') throw new ApiError(401, 'invalid_token');
+    return { userId: payload.sub as string, actorId, familyId: payload.fam };
+  }
+
+  /**
+   * The link an admin pastes into a private window. It only buys the session above, once, within a few minutes, so a
+   * copy left in the clipboard or the history is soon worthless.
+   */
+  issueImpersonationTicket({ userId, actorId, familyId }: ImpersonationClaims): Promise<string> {
+    return this.sign(userId, IMPERSONATION_TICKET_AUDIENCE, IMPERSONATION_TICKET_TYPE, IMPERSONATION_TICKET_SECONDS, {
+      act: { sub: actorId },
+      fam: familyId,
+      jti: randomBytes(16).toString('base64url'),
+    });
+  }
+
+  /** Verifies the link and spends it: a second use is refused. */
+  async redeemImpersonationTicket(ticket: string): Promise<ImpersonationClaims> {
+    const payload = await this.verifyPayload(ticket, IMPERSONATION_TICKET_AUDIENCE, IMPERSONATION_TICKET_TYPE, 'invalid_ticket');
+    const actorId = (payload.act as { sub?: unknown } | undefined)?.sub;
+    if (typeof actorId !== 'string' || typeof payload.fam !== 'string' || typeof payload.jti !== 'string') {
+      throw new ApiError(401, 'invalid_ticket');
+    }
+    this.spendTicket(payload.jti, (payload.exp as number) * 1000);
+    return { userId: payload.sub as string, actorId, familyId: payload.fam };
+  }
+
+  /**
+   * Kept in memory: a ticket lives three minutes, so a restart forgets only tickets about to expire. With more than one
+   * server instance this needs a shared store.
+   */
+  private readonly spentTickets = new Map<string, number>();
+
+  private spendTicket(jti: string, expiresAtMs: number): void {
+    const now = Date.now();
+    for (const [id, expiry] of this.spentTickets) if (expiry + CLOCK_TOLERANCE_SECONDS * 1000 < now) this.spentTickets.delete(id);
+    if (this.spentTickets.has(jti)) throw new ApiError(401, 'invalid_ticket');
+    this.spentTickets.set(jti, expiresAtMs);
+  }
+
+  /** The session family behind a dashboard refresh cookie, while it can still be used. */
+  async liveFamilyOf(presentedToken: string): Promise<{ userId: string; familyId: string } | null> {
+    const current = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(presentedToken) },
+      select: { userId: true, familyId: true, audience: true, revokedAt: true, replacedById: true, expiresAt: true },
+    });
+    if (current?.audience !== 'DASHBOARD' || current.revokedAt || current.replacedById || current.expiresAt <= new Date()) {
+      return null;
+    }
+    return { userId: current.userId, familyId: current.familyId };
+  }
+
+  /** Whether the session has not been signed out, revoked or expired. */
+  async isFamilyLive(familyId: string, userId: string): Promise<boolean> {
+    const live = await this.prisma.refreshToken.findFirst({
+      where: { familyId, userId, audience: 'DASHBOARD', revokedAt: null, replacedById: null, expiresAt: { gt: new Date() } },
+      select: { id: true },
+    });
+    return live !== null;
   }
 
   /** Starts a new token family, one per signed-in device. */
@@ -170,6 +265,11 @@ export class TokensService {
   }
 
   private async verifySubject(token: string, audience: string, type: string, errorCode: string): Promise<string> {
+    const payload = await this.verifyPayload(token, audience, type, errorCode);
+    return payload.sub as string;
+  }
+
+  private async verifyPayload(token: string, audience: string, type: string, errorCode: string): Promise<JWTPayload> {
     try {
       const header = decodeProtectedHeader(token);
       if (FORBIDDEN_HEADERS.some((name) => name in header) || header.kid !== this.keyId) {
@@ -183,15 +283,15 @@ export class TokensService {
         requiredClaims: ['sub', 'iss', 'aud', 'iat', 'nbf', 'exp'],
         clockTolerance: CLOCK_TOLERANCE_SECONDS,
       });
-      return payload.sub as string;
+      return payload;
     } catch {
       // Every failure looks the same to the client.
       throw new ApiError(401, errorCode);
     }
   }
 
-  private sign(subject: string, audience: string, type: string, seconds: number): Promise<string> {
-    return new SignJWT()
+  private sign(subject: string, audience: string, type: string, seconds: number, claims: JWTPayload = {}): Promise<string> {
+    return new SignJWT(claims)
       .setProtectedHeader({ alg: ALGORITHM, typ: type, kid: this.keyId })
       .setSubject(subject)
       .setIssuer(ISSUER)

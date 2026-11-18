@@ -31,6 +31,12 @@ export const phoneField = z
 export const isUniqueViolation = (error: unknown): boolean =>
   error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 
+/**
+ * The day's attendance record: one row per student per day. A recitation also writes its attendance there,
+ * so counting these rows counts each day once, however many recitations the day had.
+ */
+export const ATTENDANCE_DAY = { attendance: { not: null }, attendanceOn: { not: null } } satisfies Prisma.EvaluationWhereInput;
+
 /** The share of sessions attended. Excused absences don't count either way, and no records means no figure. */
 export function attendanceRate(counts: Partial<Record<AttendanceStatus, number>>): number | null {
   const attended = (counts.PRESENT ?? 0) + (counts.LATE ?? 0);

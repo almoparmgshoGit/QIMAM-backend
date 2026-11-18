@@ -43,6 +43,16 @@ export type CreateRecitationDto = z.infer<typeof createRecitationSchema>;
 export const evaluateSessionSchema = z.strictObject(evaluationFields).superRefine(checkEvaluation);
 export type EvaluateSessionDto = z.infer<typeof evaluateSessionSchema>;
 
+/** A correction to a recitation already saved. What was recited, and the attendance, stay as they were. */
+export const updateRecitationSchema = z
+  .strictObject({
+    score: z.number().min(0).max(MAX_SCORE).optional(),
+    note: z.string().trim().max(1000).optional(),
+    segmentStatus: z.enum(['NEEDS_REVIEW', 'MASTERED']).nullable().optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, 'nothing to update');
+export type UpdateRecitationDto = z.infer<typeof updateRecitationSchema>;
+
 export const attendanceSchema = z.strictObject({ studentId: idSchema, attendance: z.enum(['PRESENT', 'LATE', 'ABSENT', 'EXCUSED']) });
 export type AttendanceDto = z.infer<typeof attendanceSchema>;
 
@@ -93,13 +103,25 @@ export type CreateTaskDto = z.infer<typeof createTaskSchema>;
 export const listTasksSchema = z.strictObject({ status: z.enum(['ongoing', 'overdue', 'done']).optional() });
 export type ListTasksDto = z.infer<typeof listTasksSchema>;
 
-export const listSessionsSchema = z.strictObject({ ...pageFields, kind: z.enum(['RECITATION', 'CORRECTION']).optional() });
+const sessionKind = z.enum(['RECITATION', 'CORRECTION', 'ISMA']);
+/** One kind, or several separated by commas. */
+export const listSessionsSchema = z.strictObject({
+  ...pageFields,
+  kind: z
+    .string()
+    .max(60)
+    .transform((value) => value.split(','))
+    .pipe(z.array(sessionKind).min(1))
+    .optional(),
+});
 export type ListSessionsDto = z.infer<typeof listSessionsSchema>;
 
 export const createSessionSchema = z
   .strictObject({
-    kind: z.enum(['RECITATION', 'CORRECTION']),
+    kind: sessionKind,
     title: textField(120),
+    /** An isma session's: whether the whole circle may stay in the room, or each student enters for her turn. */
+    entryMode: z.enum(['OPEN', 'TURN']).optional(),
     scheduledAt: z.iso.datetime({ offset: true }),
     studentId: idSchema.optional(),
     circleId: idSchema.optional(),
@@ -107,6 +129,12 @@ export const createSessionSchema = z
   .superRefine((value, ctx) => {
     if (value.kind === 'RECITATION' && !value.studentId) {
       ctx.addIssue({ code: 'custom', path: ['studentId'], message: 'a recitation session is with one student' });
+    }
+    if (value.kind === 'ISMA' && value.studentId) {
+      ctx.addIssue({ code: 'custom', path: ['studentId'], message: 'an isma session is for the whole circle' });
+    }
+    if (value.kind !== 'ISMA' && value.entryMode) {
+      ctx.addIssue({ code: 'custom', path: ['entryMode'], message: 'only an isma session has an entry mode' });
     }
     if (value.studentId && value.circleId) {
       ctx.addIssue({ code: 'custom', path: ['circleId'], message: 'send a circle or a student, not both' });
@@ -119,3 +147,30 @@ export type SessionNotesDto = z.infer<typeof sessionNotesSchema>;
 
 export const reportQuerySchema = z.strictObject({ period: z.enum(['week', 'month']).default('week') });
 export type ReportQueryDto = z.infer<typeof reportQuerySchema>;
+
+// ---------- حلقة الإسماع ----------
+
+export const ismaOrderSchema = z.strictObject({ turnIds: z.array(idSchema).min(1).max(200) });
+export type IsmaOrderDto = z.infer<typeof ismaOrderSchema>;
+
+export const ismaMarkSchema = z.strictObject({ kind: z.enum(['MISTAKE', 'WARNING']) });
+export type IsmaMarkDto = z.infer<typeof ismaMarkSchema>;
+
+export const ismaMarkNoteSchema = z.strictObject({ note: z.string().trim().max(500) });
+export type IsmaMarkNoteDto = z.infer<typeof ismaMarkNoteSchema>;
+
+export const ismaAttendanceSchema = z.strictObject({ attendance: z.enum(['PRESENT', 'LATE', 'ABSENT', 'EXCUSED']) });
+export type IsmaAttendanceDto = z.infer<typeof ismaAttendanceSchema>;
+
+/** A reminder of where she stands in the queue, or the teacher's own words. To one student, or to all of them. */
+export const ismaNotifySchema = z
+  .strictObject({
+    kind: z.enum(['TURN_REMINDER', 'CUSTOM']),
+    studentId: idSchema.optional(),
+    title: z.string().trim().max(120).optional(),
+    body: z.string().trim().max(1000).optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.kind === 'CUSTOM' && !value.body) ctx.addIssue({ code: 'custom', path: ['body'], message: 'a custom notice needs a body' });
+  });
+export type IsmaNotifyDto = z.infer<typeof ismaNotifySchema>;

@@ -19,7 +19,8 @@ export function configureApp(app: NestExpressApplication): void {
     origin: config.getOrThrow<string[]>('ADMIN_ORIGINS'),
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type'],
+    // Authorization carries the session of a window an admin opened on another account.
+    allowedHeaders: ['Content-Type', 'Authorization'],
   });
   app.use((_request: Request, response: Response, next: NextFunction) => {
     // Generated here, never taken from the client, so it cannot inject into the logs.

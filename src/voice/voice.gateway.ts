@@ -2,7 +2,7 @@ import type { OnModuleDestroy } from '@nestjs/common';
 import { type OnGatewayConnection, WebSocketGateway } from '@nestjs/websockets';
 import type { WebSocket } from 'ws';
 import { z } from 'zod';
-import { type RoomMessage, type RoomPeer, type VoiceRole, VoiceService } from './voice.service.js';
+import { type Member, type RoomMessage, type VoiceRole, VoiceService } from './voice.service.js';
 
 const JOIN_TIMEOUT_MS = 10_000;
 const HEARTBEAT_MS = 30_000;
@@ -24,7 +24,8 @@ const signalSchema = z.discriminatedUnion('kind', [
 
 const messageSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('join'), ticket: z.string().min(1).max(100) }),
-  z.strictObject({ type: z.literal('signal'), data: signalSchema }),
+  // `to` is the student a teacher's signal is for, in a room of many. Ids are nanoids.
+  z.strictObject({ type: z.literal('signal'), data: signalSchema, to: z.string().min(1).max(40).optional() }),
   z.strictObject({ type: z.literal('mute'), muted: z.boolean() }),
 ]);
 
@@ -46,7 +47,7 @@ export class VoiceGateway implements OnGatewayConnection, OnModuleDestroy {
   }
 
   handleConnection(socket: WebSocket): void {
-    let member: { sessionId: string; role: VoiceRole; peer: RoomPeer } | null = null;
+    let member: Member | null = null;
     let windowStart = Date.now();
     let messages = 0;
 
@@ -64,7 +65,7 @@ export class VoiceGateway implements OnGatewayConnection, OnModuleDestroy {
     socket.on('close', () => {
       clearTimeout(joinTimer);
       this.alive.delete(socket);
-      if (member) this.voice.leave(member.sessionId, member.role, member.peer);
+      if (member) this.voice.leave(member);
     });
 
     socket.on('message', (raw, isBinary) => {
@@ -85,21 +86,24 @@ export class VoiceGateway implements OnGatewayConnection, OnModuleDestroy {
         if (!ticket) return fail('invalid_ticket');
         clearTimeout(joinTimer);
         member = {
-          sessionId: ticket.sessionId,
+          roomId: ticket.roomId,
           role: ticket.role,
+          studentId: ticket.studentId,
           peer: { send: (outgoing) => send(socket, outgoing), close: () => socket.close(1000) },
         };
-        this.voice.join(member.sessionId, member.role, member.peer);
+        this.voice.join(member);
         return;
       }
 
       if (!member) return fail('not_joined');
       if (message.data.type === 'mute') {
-        this.voice.relay(member.sessionId, member.role, { type: 'peer-mute', muted: message.data.muted });
+        this.voice.setMuted(member, message.data.muted);
         return;
       }
       if (message.data.data.kind === FORBIDDEN_SIGNAL[member.role]) return fail('invalid_message');
-      this.voice.relay(member.sessionId, member.role, { type: 'signal', data: message.data.data });
+      // Only the teacher addresses one student. A student's signals always go to the teacher.
+      if (member.role === 'STUDENT' && message.data.to) return fail('invalid_message');
+      this.voice.signal(member, message.data.data, message.data.to);
     });
   }
 

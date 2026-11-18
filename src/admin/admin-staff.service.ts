@@ -1,11 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import type { StaffActor } from '../auth/staff.decorators.js';
 import { ApiError } from '../common/api-error.js';
+import { assertTeacherFitsCircle } from '../common/sections.js';
 import { isUniqueViolation } from '../common/staff-api.js';
 import { AuditService } from '../prisma/audit.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { assertStudentFitsCircle, assertTrackFitsCircle } from '../supervisor/circle-track.js';
 import type { RequestTransferDto } from '../supervisor/supervisor.schemas.js';
+import { NotificationsService } from '../program/notifications.service.js';
 import { SupervisorService } from '../supervisor/supervisor.service.js';
 import type { UpdateAdminCircleDto } from './admin.schemas.js';
 import { AdminService, STAFF_SELECT, toStaff } from './admin.service.js';
@@ -43,6 +45,7 @@ export class AdminStaffService {
     private readonly audit: AuditService,
     private readonly accounts: AdminService,
     private readonly supervisors: SupervisorService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async supervisorDetail(supervisorId: string) {
@@ -163,7 +166,10 @@ export class AdminStaffService {
     const teacherChanged = teacherId !== circle.teacherId;
 
     if (dto.scopeId) await this.accounts.assertScope(dto.scopeId);
-    if (teacherId && teacherChanged) await this.supervisors.assertAvailableTeacher(scopeId, teacherId);
+    if (teacherId && teacherChanged) {
+      await this.supervisors.assertAvailableTeacher(scopeId, teacherId);
+      await assertTeacherFitsCircle(this.prisma, circleId, teacherId);
+    }
     // A circle stays in its teacher's scope, so her supervisor can see it.
     if (teacherId && !teacherChanged && scopeId !== circle.scopeId) {
       const teacher = await this.prisma.user.findUnique({ where: { id: teacherId }, select: { scopeId: true } });
@@ -221,6 +227,7 @@ export class AdminStaffService {
         select: { id: true, status: true },
       });
       await this.audit.record(admin, 'transfer.request', { type: 'transfer', id: transfer.id }, { studentId, toCircleId });
+      await this.notifications.transferAwaitsTeacher(transfer.id);
       return transfer;
     } catch (error) {
       if (isUniqueViolation(error)) throw new ApiError(409, 'transfer_in_progress');

@@ -361,6 +361,61 @@ describe('dashboard', () => {
     });
   });
 
+  describe('managing staff accounts', () => {
+    it('finds accounts by name, email or phone, and by status and scope', async () => {
+      const name = `بحث ${randomId().slice(0, 8)}`;
+      const email = uniqueEmail();
+      const { body } = await admin.post('/v1/admin/staff').send({ fullName: name, email, role: 'TEACHER', scopeId: scopeB }).expect(201);
+      const { id } = (body as { staff: { id: string } }).staff;
+      const ids = async (query: string) =>
+        ((await admin.get(`/v1/admin/staff?${query}`).expect(200)).body as { items: { id: string }[] }).items.map((row) => row.id);
+
+      expect(await ids(`search=${encodeURIComponent(name)}`)).toEqual([id]);
+      expect(await ids(`search=${encodeURIComponent(email.toUpperCase())}`)).toEqual([id]);
+      expect(await ids(`search=${encodeURIComponent(name)}&scopeId=${scopeA}`)).toEqual([]);
+      expect(await ids(`search=${encodeURIComponent(name)}&status=SUSPENDED`)).toEqual([]);
+      await admin.patch(`/v1/admin/staff/${id}`).send({ status: 'SUSPENDED' }).expect(200);
+      expect(await ids(`search=${encodeURIComponent(name)}&status=SUSPENDED`)).toEqual([id]);
+    });
+
+    it('turns a teacher without a circle into a supervisor, and ends her sessions', async () => {
+      const teacher = await createStaff('TEACHER', scopeA);
+      const { body } = await admin.patch(`/v1/admin/staff/${teacher.id}`).send({ role: 'SUPERVISOR' }).expect(200);
+      expect(body).toMatchObject({ role: 'SUPERVISOR' });
+      // Her teacher session never passed the second step a supervisor needs.
+      await teacher.client.get('/v1/supervisor/home').expect(401);
+      await teacher.client.get('/v1/teacher/home').expect(401);
+      await admin.get(`/v1/admin/supervisors/${teacher.id}`).expect(200);
+      await admin.patch(`/v1/admin/staff/${teacher.id}`).send({ role: 'TEACHER' }).expect(200);
+    });
+
+    it('keeps a teacher with a circle from changing role or being deleted', async () => {
+      const { teacher } = await world(scopeA);
+      await admin.patch(`/v1/admin/staff/${teacher.id}`).send({ role: 'SUPERVISOR' }).expect(409);
+      await admin.delete(`/v1/admin/staff/${teacher.id}`).expect(409);
+    });
+
+    it('clears one way in, but never both', async () => {
+      const { body } = await admin
+        .post('/v1/admin/staff')
+        .send({ fullName: 'بريد وجوال', email: uniqueEmail(), phone: newPhone(), role: 'TEACHER', scopeId: scopeA })
+        .expect(201);
+      const { id } = (body as { staff: { id: string } }).staff;
+      const { body: updated } = await admin.patch(`/v1/admin/staff/${id}`).send({ email: null }).expect(200);
+      expect(updated).toMatchObject({ email: null });
+      await admin.patch(`/v1/admin/staff/${id}`).send({ phone: null }).expect(400);
+    });
+
+    it('deletes an account, but not its own or an administrator', async () => {
+      const teacher = await createStaff('TEACHER', scopeA);
+      await admin.delete(`/v1/admin/staff/${teacher.id}`).expect(204);
+      await admin.get(`/v1/admin/teachers/${teacher.id}`).expect(404);
+      await teacher.client.get('/v1/teacher/home').expect(401);
+      await admin.delete(`/v1/admin/staff/${adminId}`).expect(409);
+      await admin.patch(`/v1/admin/staff/${adminId}`).send({ role: 'TEACHER' }).expect(409);
+    });
+  });
+
   describe('a teacher only reaches their own students', () => {
     let mine: Awaited<ReturnType<typeof world>>;
     let other: Awaited<ReturnType<typeof world>>;
@@ -1062,6 +1117,42 @@ describe('dashboard', () => {
       await t.http().get('/v1/me').set('Authorization', `Bearer ${accessToken}`).expect(401);
     });
 
+    it('controls one student fully: file, details, circle, plan, sessions and deletion', async () => {
+      const from = await world(scopeA);
+      const to = await world(scopeA);
+      const id = from.studentId;
+
+      const detail = async () => (await admin.get(`/v1/admin/students/${id}`).expect(200)).body as { name: string; circle: { id: string } | null; phone: string };
+      expect((await detail()).circle?.id).toBe(from.circleId);
+      await admin.get(`/v1/admin/students/${id}/record`).expect(200);
+
+      await admin.patch(`/v1/admin/students/${id}`).send({ fullName: 'اسم جديد', ageBand: '20' }).expect(204);
+      expect((await detail()).name).toBe('اسم جديد');
+      await admin.patch(`/v1/admin/students/${id}`).send({}).expect(400);
+
+      // Straight into the other circle, without the teacher's acceptance.
+      await admin.post(`/v1/admin/students/${id}/move`).send({ circleId: to.circleId }).expect(204);
+      expect((await detail()).circle?.id).toBe(to.circleId);
+      await admin.post(`/v1/admin/students/${id}/move`).send({ circleId: to.circleId }).expect(409);
+
+      await admin.post(`/v1/admin/students/${id}/reset-plan`).expect(204);
+      await admin.post(`/v1/admin/students/${id}/sign-out`).expect(204);
+
+      await admin.delete(`/v1/admin/students/${id}`).expect(204);
+      await admin.get(`/v1/admin/students/${id}`).expect(404);
+    });
+
+    it('signs a student out of every device', async () => {
+      const { accessToken, refreshToken } = await register(t);
+      const { id } = (await t.http().get('/v1/me').set('Authorization', `Bearer ${accessToken}`).expect(200)).body as { id: string };
+      await admin.post(`/v1/admin/students/${id}/sign-out`).expect(204);
+      await t.http().post('/v1/auth/refresh').send({ refreshToken }).expect(401);
+      // Staff are not students, and these routes never reach them.
+      const teacher = await createStaff('TEACHER', scopeA);
+      await admin.post(`/v1/admin/students/${teacher.id}/sign-out`).expect(404);
+      await admin.delete(`/v1/admin/students/${teacher.id}`).expect(404);
+    });
+
     it('lists with capped pages', async () => {
       await admin.get('/v1/admin/students?limit=101').expect(400);
       await admin.get('/v1/admin/students?limit=-1').expect(400);
@@ -1076,6 +1167,108 @@ describe('dashboard', () => {
       await w.supervisor.post('/v1/supervisor/announcements').send({ audience: 'SCOPE', title: 'للنطاق', body: 'نص' }).expect(201);
       await w.supervisor.post('/v1/supervisor/announcements').send({ audience: 'SCOPE', circleId: w.circleId, title: 'x', body: 'x' }).expect(400);
       await w.supervisor.post('/v1/supervisor/announcements').send({ audience: 'CIRCLE', title: 'x', body: 'x' }).expect(400);
+    });
+  });
+
+  describe('an admin using another account', () => {
+    const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
+    const impersonate = (client: Agent, id: string) => client.post(`/v1/staff/auth/impersonate/${id}`);
+    /** As the private window does: it has none of the admin's cookies, only the link. */
+    const redeem = (ticket: string) => request(t.app.getHttpServer()).post('/v1/staff/auth/impersonate').set('Origin', ORIGIN).send({ ticket });
+    const ticketFor = async (client: Agent, id: string) => ((await impersonate(client, id).expect(200)).body as { ticket: string }).ticket;
+    const openAs = async (client: Agent, id: string) => ((await redeem(await ticketFor(client, id)).expect(200)).body as { token: string }).token;
+
+    it('opens a supervisor with an authenticator, without its password or code, in a session of its own', async () => {
+      const supervisor = await createStaff('SUPERVISOR', scopeA);
+      const response = await impersonate(admin, supervisor.id).expect(200);
+      // No cookie: the admin's own session in this browser is left as it was.
+      expect(response.headers['set-cookie']).toBeUndefined();
+      const { ticket } = response.body as { ticket: string };
+      // The link itself opens nothing: it only buys a session, once.
+      await agent().get('/v1/staff/auth/me').set(bearer(ticket)).expect(401);
+      const redeemed = await redeem(ticket).expect(200);
+      expect(redeemed.headers['set-cookie']).toBeUndefined();
+      const { token } = redeemed.body as { token: string };
+      expect((await redeem(ticket).expect(401)).body).toMatchObject({ code: 'invalid_ticket' });
+
+      const { body: me } = await agent().get('/v1/staff/auth/me').set(bearer(token)).expect(200);
+      expect(me).toMatchObject({ id: supervisor.id, role: 'SUPERVISOR', impersonatedBy: { id: adminId } });
+      await agent().get('/v1/supervisor/circles').set(bearer(token)).expect(200);
+      // It is the supervisor, not an admin.
+      await agent().get('/v1/admin/scopes').set(bearer(token)).expect(403);
+      expect((await admin.get('/v1/staff/auth/me').expect(200)).body as { role: string; impersonatedBy: unknown }).toMatchObject({
+        role: 'ADMIN',
+        impersonatedBy: null,
+      });
+
+      // The browser asks first whether the dashboard may send the session header at all.
+      const preflight = await request(t.app.getHttpServer())
+        .options('/v1/staff/auth/me')
+        .set('Origin', ORIGIN)
+        .set('Access-Control-Request-Method', 'GET')
+        .set('Access-Control-Request-Headers', 'authorization')
+        .expect(204);
+      expect(String(preflight.headers['access-control-allow-headers']).toLowerCase()).toContain('authorization');
+
+      const audit = await t.prisma.auditLog.findFirst({ where: { action: 'staff.impersonate', targetId: supervisor.id } });
+      expect(audit).toMatchObject({ actorId: adminId, actorRole: 'ADMIN' });
+    });
+
+    it('opens a teacher, and leaves the password to its owner', async () => {
+      const w = await world(scopeA);
+      const token = await openAs(admin, w.teacher.id);
+      const { body: me } = await agent().get('/v1/staff/auth/me').set(bearer(token)).expect(200);
+      expect(me).toMatchObject({ role: 'TEACHER', impersonatedBy: { id: adminId } });
+      await agent()
+        .post('/v1/staff/auth/password/change')
+        .set(bearer(token))
+        .send({ currentPassword: PASSWORD, newPassword: 'Another-Sturdy-Pass-5512' })
+        .expect(403);
+      // A session can't be passed off as a link.
+      await redeem(token).expect(401);
+    });
+
+    it('is for admins only, and only on an active teacher or supervisor', async () => {
+      const supervisor = await createStaff('SUPERVISOR', scopeA);
+      const teacher = await createStaff('TEACHER', scopeA);
+      await impersonate(supervisor.client, teacher.id).expect(403);
+      await impersonate(admin, adminId).expect(404);
+      await impersonate(admin, await newStudentId()).expect(404);
+      // Suspended after the link was made: the link no longer works.
+      const ticket = await ticketFor(admin, teacher.id);
+      await admin.patch(`/v1/admin/staff/${teacher.id}`).send({ status: 'SUSPENDED' }).expect(200);
+      await redeem(ticket).expect(401);
+      expect((await impersonate(admin, teacher.id).expect(409)).body).toMatchObject({ code: 'account_suspended' });
+      await agent().get('/v1/staff/auth/me').set(bearer('not-a-token')).expect(401);
+    });
+
+    it('ends when the account is suspended or the admin signs out', async () => {
+      const email = uniqueEmail();
+      await t.prisma.user.create({
+        data: {
+          email,
+          fullName: 'مديرة ثانية',
+          role: 'ADMIN',
+          staffCredential: { create: { passwordHash: await argon2.hash(PASSWORD, { type: argon2.argon2id }) } },
+        },
+      });
+      const { client: secondAdmin } = await loginWithEnrollment(email);
+      const supervisor = await createStaff('SUPERVISOR', scopeA);
+      const teacher = await createStaff('TEACHER', scopeA);
+
+      const asTeacher = await openAs(secondAdmin, teacher.id);
+      const asSupervisor = await openAs(secondAdmin, supervisor.id);
+      const unusedLink = await ticketFor(secondAdmin, teacher.id);
+      await agent().get('/v1/staff/auth/me').set(bearer(asTeacher)).expect(200);
+
+      await admin.patch(`/v1/admin/staff/${supervisor.id}`).send({ status: 'SUSPENDED' }).expect(200);
+      await agent().get('/v1/staff/auth/me').set(bearer(asSupervisor)).expect(401);
+
+      await secondAdmin.post('/v1/staff/auth/logout').expect(204);
+      await agent().get('/v1/staff/auth/me').set(bearer(asTeacher)).expect(401);
+      await redeem(unusedLink).expect(401);
+      // Signed out, the admin can't make another link.
+      await impersonate(secondAdmin, teacher.id).expect(401);
     });
   });
 });

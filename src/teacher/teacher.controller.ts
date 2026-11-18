@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
 import { CurrentStaff, Dashboard, Roles, type StaffActor } from '../auth/staff.decorators.js';
 import { idSchema } from '../common/staff-api.js';
 import { VoiceService } from '../voice/voice.service.js';
@@ -26,6 +26,8 @@ import {
   type ReportQueryDto,
   reportQuerySchema,
   type SessionNotesDto,
+  type UpdateRecitationDto,
+  updateRecitationSchema,
   sessionNotesSchema,
 } from './teacher.schemas.js';
 import { TeacherService } from './teacher.service.js';
@@ -67,6 +69,21 @@ export class TeacherController {
   @Post('recitations')
   createRecitation(@CurrentStaff() staff: StaffActor, @Body({ schema: createRecitationSchema }) body: CreateRecitationDto) {
     return this.teacher.createRecitation(staff, body);
+  }
+
+  @Patch('recitations/:id')
+  updateRecitation(
+    @CurrentStaff() staff: StaffActor,
+    @Param('id', { schema: idSchema }) id: string,
+    @Body({ schema: updateRecitationSchema }) body: UpdateRecitationDto,
+  ) {
+    return this.teacher.updateRecitation(staff, id, body);
+  }
+
+  @Delete('recitations/:id')
+  @HttpCode(204)
+  async deleteRecitation(@CurrentStaff() staff: StaffActor, @Param('id', { schema: idSchema }) id: string) {
+    await this.teacher.deleteRecitation(staff, id);
   }
 
   @Get('attendance')

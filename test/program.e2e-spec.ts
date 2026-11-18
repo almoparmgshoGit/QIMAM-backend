@@ -1,10 +1,11 @@
+import zlib from 'node:zlib';
 import argon2 from 'argon2';
 import { generateSync } from 'otplib';
 import request from 'supertest';
 import { randomId } from '../src/common/ids.js';
 import { SURAHS } from '../src/common/surahs.js';
 import { NotificationsService } from '../src/program/notifications.service.js';
-import { createTestApp, keepStaffSignedIn, newPhone, register, type TestApp, finishWirdSteps, trackIdOf } from './helpers.js';
+import { createTestApp, keepStaffSignedIn, newPhone, nextWirdDay, register, type TestApp, finishWirdSteps, trackIdOf } from './helpers.js';
 
 const ORIGIN = 'http://localhost:3000';
 const PASSWORD = 'Sturdy-Pass-9271-xyz';
@@ -32,9 +33,9 @@ describe('program', () => {
     return client;
   }
 
-  async function newStaff(role: 'TEACHER' | 'SUPERVISOR', scopeId: string) {
+  async function newStaff(role: 'TEACHER' | 'SUPERVISOR', scopeId: string, section: 'WOMEN' | 'MEN' = 'WOMEN') {
     const email = uniqueEmail();
-    const { body } = await admin.post('/v1/admin/staff').send({ fullName: `${role} اختبار`, email, role, scopeId }).expect(201);
+    const { body } = await admin.post('/v1/admin/staff').send({ fullName: `${role} اختبار`, email, role, scopeId, section }).expect(201);
     const created = body as { staff: { id: string }; setupToken: string };
     await agent().post('/v1/staff/auth/password/set').send({ token: created.setupToken, password: PASSWORD }).expect(204);
     if (role === 'SUPERVISOR') return { id: created.staff.id, client: await enroll(email), email };
@@ -45,10 +46,20 @@ describe('program', () => {
 
   const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
 
-  async function newStudent() {
-    const reg = await register(t);
+  async function newStudent(section: 'women' | 'men' = 'women') {
+    const reg = await register(t, newPhone(), section);
     const { id } = (await t.http().get('/v1/me').set(bearer(reg.accessToken)).expect(200)).body as { id: string };
     return { ...reg, id };
+  }
+
+  /** A copy of the REGISTRATION track whose students recite by recording, so it is open to the men's section. */
+  async function recordedTrack() {
+    const { id: _id, code: _code, createdAt: _createdAt, updatedAt: _updatedAt, ...steady } = await t.prisma.trackTemplate.findUniqueOrThrow({ where: { code: 'steady' } });
+    const code = `recorded-${randomId().slice(0, 8)}`;
+    return t.prisma.trackTemplate.create({
+      data: { ...steady, code, name: `مسار ${code}`, recitationMode: 'RECORDING', wirdSteps: steady.wirdSteps ?? undefined, encouragements: steady.encouragements ?? undefined },
+      select: { id: true, code: true },
+    });
   }
 
   /** A teacher and circle in scope A, with one student on a plan. */
@@ -64,7 +75,7 @@ describe('program', () => {
   async function onShortPlan(studentId: string, surahs: number[], gateMode: 'ACTIVE' | 'RELAXED' | 'TEACHER' | 'PAUSED' = 'ACTIVE') {
     const { body } = await admin
       .post('/v1/admin/tracks')
-      .send({ kind: 'MEMORIZATION', name: `مسار ${randomId().slice(0, 6)}`, audience: 'اختبار', duration: 'شهر', dailyUnit: 'SURAH', wirdDays: [0, 1, 2, 3, 4, 5, 6], consolidationDays: 0 })
+      .send({ kind: 'MEMORIZATION', name: `مسار ${randomId().slice(0, 6)}`, audience: 'اختبار', durationMonths: 1, memorizationOrder: 'FORWARD', dailyUnit: 'SURAH', wirdDays: [0, 1, 2, 3, 4, 5, 6], consolidationDays: 0 })
       .expect(201);
     const { id: templateId } = body as { id: string };
     await admin.patch(`/v1/admin/gate-rules/tracks/${templateId}`).send({ mode: gateMode }).expect(204);
@@ -119,7 +130,7 @@ describe('program', () => {
       const { body } = await t
         .http()
         .post('/v1/auth/otp/verify')
-        .send({ phone, code: t.codeFor(phone), registration: { fullName: 'سارة علي أحمد', country: 'مصر', ageBand: '20', trackId: 'stabilization', trackStart: 'fatiha', pledgesAccepted: true } })
+        .send({ phone, code: t.codeFor(phone), registration: { fullName: 'سارة علي أحمد', country: 'مصر', ageBand: '20', section: 'women', trackId: 'stabilization', trackStart: 'fatiha', pledgesAccepted: true } })
         .expect(200);
       const { accessToken } = body as { accessToken: string };
       expect((await program(accessToken)).summary.nextLabel).toContain('الفاتحة');
@@ -235,8 +246,9 @@ describe('program', () => {
       expect((await approve(room, id, 6).expect(409)).body).toMatchObject({ code: 'score_below_pass' });
       await approve(room, id, 7).expect(204);
 
-      // Decided once, and the next surah opens.
+      // Decided once, and the next surah opens, on the next day.
       await approve(room, id, 9).expect(404);
+      await nextWirdDay(t, token);
       await complete(token).expect(204);
       const { summary } = await program(token);
       expect(summary).toMatchObject({ passedSurahs: 1 });
@@ -272,6 +284,7 @@ describe('program', () => {
       const room = await classroom();
       await onShortPlan(room.student.id, [113, 114], 'PAUSED');
       await complete(room.student.accessToken).expect(204);
+      await nextWirdDay(t, room.student.accessToken);
       await complete(room.student.accessToken).expect(204);
       expect((await room.teacher.client.get('/v1/teacher/gates').expect(200)).body).toEqual([]);
       expect((await program(room.student.accessToken)).summary.status).toBe('completed');
@@ -401,7 +414,7 @@ describe('program', () => {
   });
 
   describe('tracks', () => {
-    const memorization = { kind: 'MEMORIZATION', name: 'مسار جديد', audience: 'الجميع', duration: 'سنة', dailyUnit: 'PAGE', wirdDays: [0, 1], consolidationDays: 1 };
+    const memorization = { kind: 'MEMORIZATION', name: 'مسار جديد', audience: 'الجميع', durationMonths: 12, memorizationOrder: 'FORWARD', dailyUnit: 'PAGE', wirdDays: [0, 1], consolidationDays: 1 };
 
     it('starts with the four original tracks, with counts', async () => {
       const tracks = (await admin.get('/v1/admin/tracks').expect(200)).body as { code: string; reviewDays: number[]; enrollment: { total: number } }[];
@@ -424,12 +437,100 @@ describe('program', () => {
     });
 
     it('keeps each kind\'s fields apart', async () => {
-      const { id } = (await admin.post('/v1/admin/tracks').send({ kind: 'CORRECTION', name: 'x', audience: 'x', duration: 'x', focus: 'x', sessionsPerWeek: 2, application: 'x' }).expect(201)).body as { id: string };
+      const { id } = (await admin.post('/v1/admin/tracks').send({ kind: 'CORRECTION', name: 'x', audience: 'x', durationMonths: 3, focus: 'x', sessionsPerWeek: 2, application: 'x' }).expect(201)).body as { id: string };
       expect((await admin.patch(`/v1/admin/tracks/${id}`).send({ dailyUnit: 'PAGE' }).expect(400)).body).toMatchObject({ code: 'field_not_for_this_track' });
     });
 
+    describe('a set number of ayahs a day', () => {
+      const ayahs = { ...memorization, memorizationOrder: undefined, selectedSurahs: [68, 67], dailyUnit: 'AYAHS', dailyAyahs: 7 };
+
+      it.each([
+        ['without a number', { dailyAyahs: undefined }],
+        ['more than the longest surah', { dailyAyahs: 287 }],
+        ['a number with another unit', { dailyUnit: 'PAGE' }],
+      ])('is refused %s', async (_name, change) => {
+        await admin.post('/v1/admin/tracks').send({ ...ayahs, ...change }).expect(400);
+      });
+
+      it('cuts each chosen surah by that number, in the mushaf order, and follows a change to it', async () => {
+        const { id } = (await admin.post('/v1/admin/tracks').send(ayahs).expect(201)).body as { id: string };
+        const tracks = (await admin.get('/v1/admin/tracks').expect(200)).body as { id: string; scopeLabel: string; dailyAyahs: number }[];
+        // Chosen surahs have no direction.
+        expect(tracks.find((track) => track.id === id)).toMatchObject({ scopeLabel: 'الملك، القلم', dailyAyahs: 7 });
+        const template = await t.prisma.trackTemplate.findUniqueOrThrow({ where: { id }, select: { surahOrder: true } });
+        expect(template.surahOrder).toEqual([67, 68]);
+
+        const student = await newStudent();
+        await t.prisma.studentPlan.update({ where: { studentId: student.id }, data: { templateId: id, surahOrder: template.surahOrder, completedUnits: 0 } });
+        expect((await program(student.accessToken)).summary.nextLabel).toBe('الملك · 1-7');
+
+        // Either part changes alone, and leaving AYAHS drops the number.
+        await admin.patch(`/v1/admin/tracks/${id}`).send({ dailyAyahs: 10 }).expect(204);
+        expect((await program(student.accessToken)).summary.nextLabel).toBe('الملك · 1-10');
+        await admin.patch(`/v1/admin/tracks/${id}`).send({ dailyUnit: 'SURAH' }).expect(204);
+        expect(await t.prisma.trackTemplate.findUniqueOrThrow({ where: { id }, select: { dailyAyahs: true } })).toEqual({ dailyAyahs: null });
+        expect((await admin.patch(`/v1/admin/tracks/${id}`).send({ dailyUnit: 'AYAHS' }).expect(400)).body).toMatchObject({ code: 'daily_ayahs_invalid' });
+        await admin.patch(`/v1/admin/tracks/${id}`).send({ dailyUnit: 'AYAHS', dailyAyahs: 5 }).expect(204);
+
+        // Counting ayahs suits any scope, the whole Quran included.
+        const wholeQuran = { memorizationOrder: 'FORWARD', juzFrom: null, juzTo: null, selectedSurahs: [] };
+        await admin.patch(`/v1/admin/tracks/${id}`).send(wholeQuran).expect(204);
+      });
+
+      it('counts ayahs over the whole Quran or a juz range', async () => {
+        await admin.post('/v1/admin/tracks').send({ ...ayahs, selectedSurahs: [] }).expect(201);
+        await admin.post('/v1/admin/tracks').send({ ...ayahs, selectedSurahs: [], juzFrom: 29, juzTo: 30 }).expect(201);
+      });
+    });
+
+    describe('sessions a day', () => {
+      const split = { ...memorization, memorizationOrder: undefined, selectedSurahs: [67], dailyUnit: 'AYAHS', dailyAyahs: 7, dailySessions: 2 };
+      type Session = { number: number; fromAyah: number; toAyah: number; title: string; done: boolean };
+      const sessionsOf = async (token: string) =>
+        ((await t.http().get('/v1/me/dashboard').set('Authorization', `Bearer ${token}`).expect(200)).body as { plan: { sessions: Session[] } }).plan.sessions;
+
+      it.each([
+        ['one session', { dailySessions: 1 }],
+        ['more than four', { dailySessions: 5 }],
+      ])('is refused with %s', async (_name, change) => {
+        await admin.post('/v1/admin/tracks').send({ ...split, ...change }).expect(400);
+      });
+
+      it('splits the day by ayahs, marks each session on its own, and holds the wird until all are done', async () => {
+        const { id } = (await admin.post('/v1/admin/tracks').send(split).expect(201)).body as { id: string };
+        const template = await t.prisma.trackTemplate.findUniqueOrThrow({ where: { id }, select: { surahOrder: true } });
+        const student = await newStudent();
+        await t.prisma.studentPlan.update({ where: { studentId: student.id }, data: { templateId: id, surahOrder: template.surahOrder, completedUnits: 0 } });
+
+        // Al-Mulk 1-7, as 1-4 and 5-7.
+        expect(await sessionsOf(student.accessToken)).toMatchObject([
+          { number: 1, fromAyah: 1, toAyah: 4, title: 'الفترة الأولى', done: false },
+          { number: 2, fromAyah: 5, toAyah: 7, title: 'الفترة الثانية', done: false },
+        ]);
+        const session = (number: number, done: boolean) =>
+          t.http().post(`/v1/me/wird/sessions/${number}`).set('Authorization', `Bearer ${student.accessToken}`).send({ done });
+        await session(2, true).expect(204);
+        expect((await sessionsOf(student.accessToken)).map(({ done }) => done)).toEqual([false, true]);
+        await session(3, true).expect(400);
+
+        // Every step done, but the first session isn't.
+        await t.prisma.wirdProgress.update({
+          where: { planId_unitIndex: { planId: (await t.prisma.studentPlan.findUniqueOrThrow({ where: { studentId: student.id } })).id, unitIndex: 0 } },
+          data: { repeatCount: 999, reviewCount: 999, listenCount: 999, doneSteps: Array.from({ length: 50 }, (_, index) => index) },
+        });
+        const complete = () => t.http().post('/v1/me/wird/complete').set('Authorization', `Bearer ${student.accessToken}`);
+        expect((await complete().expect(409)).body).toMatchObject({ code: 'wird_sessions_incomplete' });
+        await session(1, true).expect(204);
+        await complete().expect(204);
+
+        // Turning the option off keeps the day whole.
+        await admin.patch(`/v1/admin/tracks/${id}`).send({ dailySessions: null }).expect(204);
+        expect(await sessionsOf(student.accessToken)).toEqual([]);
+      });
+    });
+
     it('registers a student on a track the administrator added, and refuses a correction track', async () => {
-      const dto = { name: 'مسار مضاف', audience: 'الجميع', duration: 'سنة' };
+      const dto = { name: 'مسار مضاف', audience: 'الجميع', durationMonths: 12 };
       const added = (await admin.post('/v1/admin/tracks').send({ kind: 'MEMORIZATION', ...dto, dailyUnit: 'PAGE', wirdDays: [0, 1], consolidationDays: 1 }).expect(201)).body as { id: string };
       const tracks = (await admin.get('/v1/admin/tracks').expect(200)).body as { id: string; code: string }[];
       const { code } = tracks.find(({ id }) => id === added.id)!;
@@ -440,7 +541,7 @@ describe('program', () => {
         return t
           .http()
           .post('/v1/auth/otp/verify')
-          .send({ phone, code: t.codeFor(phone), registration: { fullName: 'نورة علي أحمد', country: 'مصر', ageBand: '20', trackId, trackStart: null, pledgesAccepted: true } });
+          .send({ phone, code: t.codeFor(phone), registration: { fullName: 'نورة علي أحمد', country: 'مصر', ageBand: '20', section: 'women', trackId, trackStart: null, pledgesAccepted: true } });
       };
 
       const registered = await register(code);
@@ -462,7 +563,7 @@ describe('program', () => {
         const { body } = await t
           .http()
           .post('/v1/auth/otp/verify')
-          .send({ phone, code: t.codeFor(phone), registration: { fullName: 'نورة علي أحمد', country: 'مصر', ageBand: '20', trackId: 'advanced', trackStart: null, pledgesAccepted: true } })
+          .send({ phone, code: t.codeFor(phone), registration: { fullName: 'نورة علي أحمد', country: 'مصر', ageBand: '20', section: 'women', trackId: 'advanced', trackStart: null, pledgesAccepted: true } })
           .expect(409);
         expect(body).toMatchObject({ code: 'track_closed' });
       } finally {
@@ -709,8 +810,9 @@ describe('program', () => {
         await t.http().get('/v1/me/dashboard').set(bearer(student.accessToken)).expect(200);
         expect(await t.prisma.studentPlan.count({ where: { studentId: student.id } })).toBe(0);
 
-        const list = (await supervisorA.get('/v1/admissions').expect(200)).body as { id: string; phone: string }[];
-        expect(list.some(({ id }) => id === student.id)).toBe(true);
+        const list = (await supervisorA.get('/v1/admissions').expect(200)).body as { scheduling: string; applicants: { id: string; phone: string }[] };
+        expect(list.scheduling).toBe('SUPERVISOR');
+        expect(list.applicants.some(({ id }) => id === student.id)).toBe(true);
         const { body: refused } = await supervisorA.post(`/v1/supervisor/circles/${room.circleId}/students`).send({ studentId: student.id }).expect(409);
         expect(refused).toMatchObject({ code: 'student_not_admitted' });
 
@@ -726,6 +828,118 @@ describe('program', () => {
         await teacher.client.get('/v1/admissions').expect(403);
       } finally {
         await setAdmission(false);
+      }
+    });
+
+    it('chooses the track after the admission test: by the tester, or by the student once accepted', async () => {
+      await setAdmission(true);
+      try {
+        const signUp = async (section: 'women' | 'men') => {
+          const phone = newPhone();
+          await t.http().post('/v1/auth/otp/request').send({ phone, purpose: 'register' }).expect(202);
+          const { body } = await t
+            .http()
+            .post('/v1/auth/otp/verify')
+            .send({ phone, code: t.codeFor(phone), registration: { fullName: 'هند علي أحمد', country: 'مصر', ageBand: '20', section, pledgesAccepted: true } })
+            .expect(200);
+          const token = (body as { accessToken: string }).accessToken;
+          const { id } = (await t.http().get('/v1/me').set(bearer(token)).expect(200)).body as { id: string };
+          return { id, token };
+        };
+        const profile = async (token: string) =>
+          (await t.http().get('/v1/me').set(bearer(token)).expect(200)).body as { trackId: string | null; trackStart: string | null };
+
+        // No track at sign-up, and none can be chosen before the test is passed.
+        const chooser = await signUp('women');
+        expect((await profile(chooser.token)).trackId).toBeNull();
+        const early = await t.http().patch('/v1/me').set(bearer(chooser.token)).send({ track: { trackId: 'steady', trackStart: null } }).expect(409);
+        expect(early.body).toMatchObject({ code: 'admission_pending' });
+
+        // Accepted with the track left open: no plan until she chooses one.
+        await supervisorA.post(`/v1/admissions/${chooser.id}/decision`).send({ accepted: true, score: 8, note: null }).expect(204);
+        expect(await t.prisma.studentPlan.count({ where: { studentId: chooser.id } })).toBe(0);
+        await t.http().patch('/v1/me').set(bearer(chooser.token)).send({ track: { trackId: 'steady', trackStart: null } }).expect(200);
+        expect((await profile(chooser.token)).trackId).toBe('steady');
+        expect(await t.prisma.studentPlan.count({ where: { studentId: chooser.id } })).toBe(1);
+
+        // The tester chooses the track, and the plan begins on it.
+        const placed = await signUp('women');
+        const tracks = (await supervisorA.get('/v1/admissions/tracks').expect(200)).body as { id: string; code: string; forMen: boolean }[];
+        const stabilization = tracks.find(({ code }) => code === 'stabilization')!;
+        await supervisorA.post(`/v1/admissions/${placed.id}/decision`).send({ accepted: true, score: 9, note: null, trackId: stabilization.id, trackStart: 'FATIHA' }).expect(204);
+        expect(await profile(placed.token)).toMatchObject({ trackId: 'stabilization', trackStart: 'fatiha' });
+        expect(await t.prisma.studentPlan.count({ where: { studentId: placed.id } })).toBe(1);
+
+        // Online recitation is for the women's section only, so the tester can't put a man on such a track.
+        const man = await signUp('men');
+        expect(stabilization.forMen).toBe(false);
+        const refused = await supervisorA.post(`/v1/admissions/${man.id}/decision`).send({ accepted: true, score: 9, note: null, trackId: stabilization.id }).expect(409);
+        expect(refused.body).toMatchObject({ code: 'track_not_for_section' });
+        expect((await profile(man.token)).trackId).toBeNull();
+      } finally {
+        await setAdmission(false);
+      }
+    });
+
+    it('runs the admission test in its own room: assigned, booked, started, and decided by the teacher', async () => {
+      const setScheduling = (scheduling: string) =>
+        admin.put('/v1/admin/settings/admission').send({ required: true, scheduling }).expect(204);
+      await setScheduling('STUDENT');
+      try {
+        const student = await newStudent();
+        const other = await newStudent();
+        const teacher = await newStaff('TEACHER', scopeA);
+        const outsider = await newStaff('TEACHER', scopeB);
+        const me = (path: string) => t.http().get(path).set(bearer(student.accessToken));
+
+        const teachers = (await supervisorA.get('/v1/admissions/teachers').expect(200)).body as { id: string }[];
+        expect(teachers.some(({ id }) => id === teacher.id)).toBe(true);
+        expect(teachers.some(({ id }) => id === outsider.id)).toBe(false);
+        await supervisorA.put(`/v1/admissions/${student.id}/test`).send({ teacherId: outsider.id, scheduledAt: null }).expect(404);
+
+        // With STUDENT scheduling, the supervisor assigns only the teacher.
+        const later = new Date(Date.now() + 2 * 86_400_000).toISOString();
+        await supervisorA.put(`/v1/admissions/${student.id}/test`).send({ teacherId: teacher.id, scheduledAt: later }).expect(409);
+        const { body: assigned } = await supervisorA.put(`/v1/admissions/${student.id}/test`).send({ teacherId: teacher.id, scheduledAt: null }).expect(200);
+        await supervisorA.put(`/v1/admissions/${other.id}/test`).send({ teacherId: teacher.id, scheduledAt: null }).expect(200);
+        const testId = (assigned as { id: string }).id;
+
+        const { body: slot } = await teacher.client.post('/v1/teacher/admission/slots').send({ startsAt: later }).expect(201);
+        const slotId = (slot as { id: string }).id;
+        await teacher.client.post('/v1/teacher/admission/slots').send({ startsAt: later }).expect(409);
+
+        const view = (await me('/v1/me/admission').expect(200)).body as { canBook: boolean; slots: { id: string }[] };
+        expect(view.canBook).toBe(true);
+        expect(view.slots.map(({ id }) => id)).toEqual([slotId]);
+
+        await t.http().post('/v1/me/admission/book').set(bearer(student.accessToken)).send({ slotId }).expect(200);
+        // The same time can't go to two students, and a booked time can't be removed.
+        await t.http().post('/v1/me/admission/book').set(bearer(other.accessToken)).send({ slotId }).expect(409);
+        await teacher.client.delete(`/v1/teacher/admission/slots/${slotId}`).expect(409);
+        const booked = (await me('/v1/me/admission').expect(200)).body as { canBook: boolean; test: { scheduledAt: string } };
+        expect(booked.canBook).toBe(false);
+        expect(new Date(booked.test.scheduledAt).toISOString()).toBe(later);
+
+        // No room before the teacher starts, and only the assigned teacher's own room.
+        await t.http().post(`/v1/me/admission/tests/${testId}/voice-ticket`).set(bearer(student.accessToken)).expect(409);
+        await outsider.client.post(`/v1/teacher/admission/tests/${testId}/start`).expect(404);
+        await teacher.client.post(`/v1/teacher/admission/tests/${testId}/start`).expect(204);
+        await t.http().post(`/v1/me/admission/tests/${testId}/voice-ticket`).set(bearer(student.accessToken)).expect(200);
+        await t.http().post(`/v1/me/admission/tests/${testId}/voice-ticket`).set(bearer(other.accessToken)).expect(404);
+        await teacher.client.post(`/v1/teacher/admission/tests/${testId}/voice-ticket`).expect(200);
+        await supervisorA.put(`/v1/admissions/${student.id}/test`).send({ teacherId: teacher.id, scheduledAt: null }).expect(409);
+
+        await teacher.client.post(`/v1/teacher/admission/tests/${testId}/decision`).send({ accepted: true, score: 9, note: null }).expect(204);
+        expect(await t.prisma.studentPlan.count({ where: { studentId: student.id } })).toBe(1);
+        expect((await t.prisma.admissionTest.findUniqueOrThrow({ where: { id: testId } })).status).toBe('COMPLETED');
+        await t.http().post(`/v1/me/admission/tests/${testId}/voice-ticket`).set(bearer(student.accessToken)).expect(409);
+
+        // A supervisor's decision cancels a test not yet held, and frees nothing it didn't book.
+        await supervisorA.post(`/v1/admissions/${other.id}/decision`).send({ accepted: false, score: null, note: null }).expect(204);
+        const closed = await t.prisma.admissionTest.findFirstOrThrow({ where: { studentId: other.id } });
+        expect(closed.status).toBe('CANCELLED');
+      } finally {
+        await admin.put('/v1/admin/settings/admission').send({ required: false }).expect(204);
       }
     });
 
@@ -870,34 +1084,164 @@ describe('program', () => {
     });
   });
 
-  describe('motivation', () => {
-    it('adds a manual badge, and only one badge for each automatic event', async () => {
-      const fields = { label: 'شارة', condition: 'شرط', icon: 'medal-outline' };
-      const { id } = (await admin.post('/v1/admin/badges').send({ ...fields, trigger: 'MANUAL' }).expect(201)).body as { id: string };
-      const { badges } = (await admin.get('/v1/admin/motivation').expect(200)).body as { badges: { id: string; icon: string }[] };
-      expect(badges.find((badge) => badge.id === id)?.icon).toBe('medal-outline');
-      // The test data already has a badge for passing a surah.
-      const { body } = await admin.post('/v1/admin/badges').send({ ...fields, trigger: 'SURAH_PASSED' }).expect(409);
-      expect(body).toMatchObject({ code: 'badge_trigger_taken' });
+  describe('sections', () => {
+    it('keeps the men\'s and the women\'s sections apart, and speaks to each in its own wording', async () => {
+      const man = await newStudent('men');
+      const me = (await t.http().get('/v1/me').set(bearer(man.accessToken)).expect(200)).body as { section: string; trackId: string | null };
+      expect(me).toMatchObject({ section: 'men', trackId: null });
+      await t.http().post('/v1/auth/otp/verify').send({ phone: newPhone(), code: '000000', registration: { fullName: 'سعد علي أحمد', country: 'مصر', ageBand: '20', trackId: 'steady', trackStart: null, pledgesAccepted: true } }).expect(400);
+
+      // Online recitation is for the women's section only: a track that uses it is closed to men, and hidden from them.
+      const recorded = await recordedTrack();
+      const live = await t.http().patch('/v1/me').set(bearer(man.accessToken)).send({ track: { trackId: 'steady', trackStart: null } }).expect(409);
+      expect(live.body).toMatchObject({ code: 'track_not_for_section' });
+      const publicTracks = (await t.http().get('/v1/tracks').expect(200)).body as { code: string; liveRecitation: boolean }[];
+      expect(publicTracks.find(({ code }) => code === 'steady')?.liveRecitation).toBe(true);
+      expect(publicTracks.find(({ code }) => code === recorded.code)?.liveRecitation).toBe(false);
+      await t.http().patch('/v1/me').set(bearer(man.accessToken)).send({ track: { trackId: recorded.code, trackStart: null } }).expect(200);
+      const goLive = await admin.patch(`/v1/admin/tracks/${recorded.id}`).send({ recitationMode: 'LIVE' }).expect(409);
+      expect(goLive.body).toMatchObject({ code: 'track_has_men' });
+
+      // A woman's circle takes no man, and a man can't teach it.
+      const { circleId, student: woman } = await classroom();
+      const womenTeacher = await newStaff('TEACHER', scopeA);
+      const { id: womenCircle } = (await supervisorA.post('/v1/supervisor/circles').send({ name: `حلقة ${randomId().slice(0, 6)}`, teacherId: womenTeacher.id, trackId: recorded.id }).expect(201)).body as { id: string };
+      const placed = await supervisorA.post(`/v1/supervisor/circles/${womenCircle}/students`).send({ studentId: man.id }).expect(409);
+      expect(placed.body).toMatchObject({ code: 'section_mismatch' });
+      const maleTeacher = await newStaff('TEACHER', scopeA, 'MEN');
+      const swapped = await supervisorA.patch(`/v1/supervisor/circles/${circleId}`).send({ teacherId: maleTeacher.id }).expect(409);
+      expect(swapped.body).toMatchObject({ code: 'section_mismatch' });
+
+      // His own section's circle takes him.
+      const { id: menCircle } = (await supervisorA.post('/v1/supervisor/circles').send({ name: `حلقة ${randomId().slice(0, 6)}`, teacherId: maleTeacher.id, trackId: recorded.id }).expect(201)).body as { id: string };
+      await supervisorA.post(`/v1/supervisor/circles/${menCircle}/students`).send({ studentId: man.id }).expect(204);
+      const profile = (await admin.get('/v1/staff/auth/me').expect(200)).body as { section: string };
+      expect(profile.section).toBe('WOMEN');
+
+      await t.app.get(NotificationsService).send([man.id, woman.id], { type: 'GENERAL', title: 'أحسنت{{|ِ}}', body: 'راسل{{|ي}} {{معلمك|معلمتك}}', dedupeKey: `section:${randomId()}` });
+      const sent = await t.prisma.notification.findMany({ where: { userId: { in: [man.id, woman.id] }, type: 'GENERAL', title: { startsWith: 'أحسنت' } }, select: { userId: true, title: true, body: true } });
+      expect(sent.find(({ userId }) => userId === man.id)).toMatchObject({ title: 'أحسنت', body: 'راسل معلمك' });
+      expect(sent.find(({ userId }) => userId === woman.id)).toMatchObject({ title: 'أحسنتِ', body: 'راسلي معلمتك' });
+    });
+  });
+
+  describe('badges', () => {
+    const manual = {
+      label: 'شارة',
+      condition: null,
+      look: { visual: 'EMOJI', icon: '🏅' },
+      color: '#2FB59B',
+      audience: 'STUDENTS',
+      trigger: 'MANUAL',
+      threshold: null,
+      supervisorCanAward: true,
+    };
+    const create = async (fields: object) => ((await admin.post('/v1/admin/badges').send({ ...manual, ...fields }).expect(201)).body as { id: string }).id;
+    type Listed = { id: string; visual: string; icon: string; condition: string | null; awarded: number };
+    const listed = async (id: string) => ((await admin.get('/v1/admin/badges').expect(200)).body as { badges: Listed[] }).badges.find((badge) => badge.id === id)!;
+
+    it('creates badges with an emoji or an icon, and checks the rule', async () => {
+      const id = await create({});
+      expect(await listed(id)).toMatchObject({ visual: 'EMOJI', icon: '🏅', awarded: 0 });
+
+      await admin.post('/v1/admin/badges').send({ ...manual, look: { visual: 'EMOJI', icon: 'not an emoji' } }).expect(400);
+      await admin.post('/v1/admin/badges').send({ ...manual, look: { visual: 'ICON', icon: 'not-an-icon' } }).expect(400);
+      // An automatic rule needs its count, and is for students only.
+      await admin.post('/v1/admin/badges').send({ ...manual, trigger: 'SURAH_PASSED' }).expect(400);
+      await admin.post('/v1/admin/badges').send({ ...manual, trigger: 'WIRD_DAYS', threshold: 5, audience: 'STAFF' }).expect(400);
+
+      const counted = await create({ trigger: 'PAGES_MEMORIZED', threshold: 3, look: { visual: 'ICON', icon: 'book-outline' } });
+      expect((await listed(counted)).condition).toBe('حفظ 3 صفحات');
+      await admin.patch(`/v1/admin/badges/${counted}`).send({ trigger: 'MANUAL' }).expect(400);
+      await admin.patch(`/v1/admin/badges/${counted}`).send({ trigger: 'MANUAL', threshold: null, audience: 'EVERYONE', label: 'معدلة' }).expect(204);
+
+      await supervisorA.post('/v1/admin/badges').send(manual).expect(403);
+      await t.prisma.badge.deleteMany({ where: { id: { in: [id, counted] } } });
+    });
+
+    it('stores only a 256×256 PNG, and serves it publicly', async () => {
+      const id = await create({ look: { visual: 'IMAGE' } });
+      const png = (width: number, height: number) => {
+        const header = Buffer.alloc(33);
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(header);
+        header.writeUInt32BE(13, 8);
+        header.write('IHDR', 12, 'ascii');
+        header.writeUInt32BE(width, 16);
+        header.writeUInt32BE(height, 20);
+        return header;
+      };
+      const upload = (data: Buffer) => admin.put(`/v1/admin/badges/${id}/image`).attach('file', data, 'badge.png');
+
+      expect((await upload(png(512, 512)).expect(400)).body).toMatchObject({ code: 'invalid_image_size' });
+      expect((await upload(Buffer.from('GIF89a not a png')).expect(400)).body).toMatchObject({ code: 'unsupported_file_type' });
+      const { imageUrl } = (await upload(png(256, 256)).expect(200)).body as { imageUrl: string };
+      expect(imageUrl).toMatch(new RegExp(`^/badges/${id}/image\\?v=\\d+$`));
+
+      const served = await t.http().get(`/v1${imageUrl}`).expect(200);
+      expect(served.headers['content-type']).toBe('image/png');
+      expect(served.headers['cross-origin-resource-policy']).toBe('cross-origin');
       await t.prisma.badge.delete({ where: { id } });
     });
 
-    it('edits a badge, awards it once, and tells the student', async () => {
-      const { badges } = (await admin.get('/v1/admin/motivation').expect(200)).body as { badges: { id: string; code: string }[] };
-      const mastery = badges.find(({ code }) => code === 'mastery')!;
-      await admin.patch(`/v1/admin/badges/${mastery.id}`).send({ condition: 'إتقان 95%' }).expect(204);
+    it('lets a supervisor give a badge in her scope only, once, and take back only her own', async () => {
+      const { teacher, student } = await classroom();
+      const outsider = await newStudent();
+      const id = await create({ audience: 'EVERYONE' });
+      const adminOnly = await create({ supervisorCanAward: false });
 
-      const student = await newStudent();
-      await admin.post(`/v1/admin/students/${student.id}/badges`).send({ badgeId: mastery.id }).expect(204);
-      await admin.post(`/v1/admin/students/${student.id}/badges`).send({ badgeId: mastery.id }).expect(204);
-      expect(await t.prisma.studentBadge.count({ where: { studentId: student.id } })).toBe(1);
+      await supervisorA.post('/v1/staff/badges/awards').send({ badgeId: id, userId: student.id, note: 'تميز' }).expect(204);
+      expect((await supervisorA.post('/v1/staff/badges/awards').send({ badgeId: id, userId: student.id }).expect(409)).body).toMatchObject({ code: 'badge_already_held' });
+      await supervisorA.post('/v1/staff/badges/awards').send({ badgeId: id, userId: teacher.id }).expect(204);
+      // Outside her scope, or a badge she may not give.
+      await supervisorA.post('/v1/staff/badges/awards').send({ badgeId: id, userId: outsider.id }).expect(404);
+      await supervisorB.post('/v1/staff/badges/awards').send({ badgeId: id, userId: outsider.id }).expect(404);
+      await supervisorA.post('/v1/staff/badges/awards').send({ badgeId: adminOnly, userId: outsider.id }).expect(404);
+
       expect(await t.prisma.notification.count({ where: { userId: student.id, type: 'BADGES' } })).toBe(1);
+      const mine = (await teacher.client.get('/v1/staff/badges/mine').expect(200)).body as { id: string }[];
+      expect(mine.map((badge) => badge.id)).toEqual([id]);
+      const board = (await t.http().get('/v1/me/badge-board').set(bearer(student.accessToken)).expect(200)).body as { badges: { id: string; awardedAt: string | null; note: string | null }[] };
+      expect(board.badges.find((badge) => badge.id === id)).toMatchObject({ note: 'تميز' });
+
+      // The administration gives to anyone, and a badge goes only to its audience.
+      await admin.post('/v1/staff/badges/awards').send({ badgeId: adminOnly, userId: outsider.id }).expect(204);
+      expect((await admin.post('/v1/staff/badges/awards').send({ badgeId: adminOnly, userId: teacher.id }).expect(409)).body).toMatchObject({ code: 'badge_not_for_recipient' });
+
+      await supervisorB.delete(`/v1/staff/badges/awards/${id}/${student.id}`).expect(404);
+      await supervisorA.delete(`/v1/staff/badges/awards/${adminOnly}/${outsider.id}`).expect(404);
+      await supervisorA.delete(`/v1/staff/badges/awards/${id}/${student.id}`).expect(204);
+      await teacher.client.post('/v1/staff/badges/awards').send({ badgeId: id, userId: student.id }).expect(403);
+      await t.prisma.badge.deleteMany({ where: { id: { in: [id, adminOnly] } } });
     });
 
-    it('does not give a badge to a staff member', async () => {
-      const { badges } = (await admin.get('/v1/admin/motivation').expect(200)).body as { badges: { id: string }[] };
-      const teacher = await newStaff('TEACHER', scopeA);
-      await admin.post(`/v1/admin/students/${teacher.id}/badges`).send({ badgeId: badges[0].id }).expect(404);
+    it('pins up to three badges, shown to those who can see the holder', async () => {
+      const { teacher, student } = await classroom();
+      const ids = [await create({}), await create({}), await create({}), await create({})];
+      for (const badgeId of ids) await admin.post('/v1/staff/badges/awards').send({ badgeId, userId: student.id }).expect(204);
+      const pin = (badgeIds: string[]) => t.http().put('/v1/me/badges/pins').set(bearer(student.accessToken)).send({ badgeIds });
+
+      await pin(ids).expect(400);
+      // Only badges she holds.
+      await pin([randomId()]).expect(404);
+      await pin([ids[2], ids[0]]).expect(204);
+
+      type Shown = Record<string, { pinned: { id: string }[]; total: number }>;
+      const seen = (await teacher.client.get(`/v1/staff/badges/showcase?ids=${student.id}`).expect(200)).body as Shown;
+      expect(seen[student.id].total).toBe(4);
+      expect(seen[student.id].pinned.map(({ id }) => id)).toEqual([ids[2], ids[0]]);
+      await supervisorA.get(`/v1/staff/badges/of/${student.id}`).expect(200);
+      // Outside her reach, a supervisor sees nothing.
+      expect((await supervisorB.get(`/v1/staff/badges/showcase?ids=${student.id}`).expect(200)).body).toEqual({});
+      await supervisorB.get(`/v1/staff/badges/of/${student.id}`).expect(404);
+
+      // Her teacher's pinned badge shows in her circle.
+      const staffBadge = await create({ audience: 'STAFF' });
+      await admin.post('/v1/staff/badges/awards').send({ badgeId: staffBadge, userId: teacher.id }).expect(204);
+      await teacher.client.put('/v1/staff/badges/mine/pins').send({ badgeIds: [staffBadge] }).expect(204);
+      const circle = (await t.http().get('/v1/me/circle').set(bearer(student.accessToken)).expect(200)).body as { teacherBadges: { pinned: { id: string }[] } };
+      expect(circle.teacherBadges.pinned.map(({ id }) => id)).toEqual([staffBadge]);
+
+      await t.prisma.badge.deleteMany({ where: { id: { in: [...ids, staffBadge] } } });
     });
 
     it('manages encouragement messages, and sends them on Saturday only when on, to all but those who declined', async () => {
@@ -925,11 +1269,121 @@ describe('program', () => {
       expect(await countFor(declines.id)).toBe(0);
     });
 
-    it('honors a circle once a month, and tells its students', async () => {
+    it('honors a circle once a month, and tells its students and its teacher', async () => {
       const room = await classroom();
-      await admin.post(`/v1/admin/circles/${room.circleId}/honor`).expect(204);
-      await admin.post(`/v1/admin/circles/${room.circleId}/honor`).expect(204);
+      const noCertificates = { studentTemplateId: null, teacherTemplateId: null };
+      await admin.post(`/v1/admin/circles/${room.circleId}/honor`).send(noCertificates).expect(201);
+      await admin.post(`/v1/admin/circles/${room.circleId}/honor`).send(noCertificates).expect(409);
       expect(await t.prisma.notification.count({ where: { userId: room.student.id, dedupeKey: { startsWith: 'honor:' } } })).toBe(1);
+      expect(await t.prisma.notification.count({ where: { userId: room.teacher.id, dedupeKey: { startsWith: 'honor-certificate:' } } })).toBe(1);
+      expect(await t.prisma.issuedCertificate.count({ where: { circleId: room.circleId } })).toBe(0);
+    });
+
+    it('gives the chosen circle certificates to its students and its teacher', async () => {
+      const room = await classroom();
+      const design = async (trigger: 'CIRCLE_HONOR' | 'CIRCLE_HONOR_TEACHER') =>
+        (
+          (
+            await admin
+              .post('/v1/admin/certificates')
+              .send({
+                name: `تكريم ${randomId().slice(0, 6)}`,
+                trigger,
+                width: 842,
+                height: 595,
+                elements: [{ id: 'name', type: 'text', x: 0, y: 0, w: 800, h: 40, text: '{{name}} · {{circle}} · {{note}}', size: 20, bold: true, color: '#000000', align: 'center' }],
+              })
+              .expect(201)
+          ).body as { id: string }
+        ).id;
+      const studentDesign = await design('CIRCLE_HONOR');
+      const teacherDesign = await design('CIRCLE_HONOR_TEACHER');
+
+      type Options = { circle: { name: string }; students: { templates: { id: string }[] }; teacher: { templates: { id: string }[]; values: { name: string } } | null };
+      const options = (await admin.get(`/v1/admin/circles/${room.circleId}/honor`).expect(200)).body as Options;
+      expect(options.students.templates.map(({ id }) => id)).toContain(studentDesign);
+      expect(options.teacher?.templates.map(({ id }) => id)).toContain(teacherDesign);
+      expect(options.teacher?.templates.map(({ id }) => id)).not.toContain(studentDesign);
+
+      const { body } = await admin
+        .post(`/v1/admin/circles/${room.circleId}/honor`)
+        .send({ studentTemplateId: studentDesign, teacherTemplateId: teacherDesign, note: 'تقديرًا للتميز' })
+        .expect(201);
+      expect(body).toEqual({ studentCertificates: 1, teacherCertificate: true });
+
+      // The student finds hers in the app.
+      const held = (await t.http().get('/v1/me/certificates').set(bearer(room.student.accessToken)).expect(200)).body as { id: string; title: string }[];
+      const studentCopy = held.find(({ title }) => title.startsWith('تكريم'));
+      expect(studentCopy).toBeDefined();
+      const studentPage = (await t.http().get(`/v1/me/certificates/${studentCopy!.id}`).set(bearer(room.student.accessToken)).expect(200)).body as { elements: { text?: string }[] };
+      expect(studentPage.elements[0].text).toContain(options.circle.name);
+      expect(studentPage.elements[0].text).toContain('تقديرًا للتميز');
+
+      // The teacher finds hers on the dashboard, and only hers.
+      const mine = (await room.teacher.client.get('/v1/staff/certificates/mine').expect(200)).body as { id: string }[];
+      expect(mine).toHaveLength(1);
+      const teacherPage = (await room.teacher.client.get(`/v1/staff/certificates/mine/${mine[0].id}`).expect(200)).body as { elements: { text?: string }[] };
+      expect(teacherPage.elements[0].text).toContain(options.teacher!.values.name);
+      await room.teacher.client.get(`/v1/staff/certificates/mine/${studentCopy!.id}`).expect(404);
+
+      await t.prisma.certificateTemplate.deleteMany({ where: { id: { in: [studentDesign, teacherDesign] } } });
+    });
+
+    it('keeps signatures without a background, prints them on certificates, and keeps those in use', async () => {
+      // A 2×2 PNG: colour type 6 has an alpha channel, colour type 2 has none and so keeps its background.
+      const png = (colorType: 2 | 6) => {
+        const chunk = (type: string, data: Buffer) => {
+          const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+          const length = Buffer.alloc(4);
+          length.writeUInt32BE(data.length);
+          const crc = Buffer.alloc(4);
+          crc.writeUInt32BE(zlib.crc32(body));
+          return Buffer.concat([length, body, crc]);
+        };
+        const header = Buffer.alloc(13);
+        header.writeUInt32BE(2, 0);
+        header.writeUInt32BE(2, 4);
+        header[8] = 8;
+        header[9] = colorType;
+        const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(2 * (colorType === 6 ? 4 : 3))]);
+        return Buffer.concat([
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+          chunk('IHDR', header),
+          chunk('IDAT', zlib.deflateSync(Buffer.concat([row, row]))),
+          chunk('IEND', Buffer.alloc(0)),
+        ]);
+      };
+      const upload = (file: Buffer, name = 'توقيع المشرفة') =>
+        admin.post('/v1/admin/certificates/assets').field('name', name).field('kind', 'SIGNATURE').attach('file', file, 'signature.png');
+
+      await upload(png(2)).expect(400);
+      await upload(Buffer.from('not a picture')).expect(400);
+      const { id: assetId } = (await upload(png(6)).expect(201)).body as { id: string };
+      const library = (await admin.get('/v1/admin/certificates/assets').expect(200)).body as { id: string; width: number; src: string }[];
+      expect(library.find(({ id }) => id === assetId)).toMatchObject({ width: 2, src: expect.stringMatching(/^data:image\/png;base64,/) });
+
+      const { id: designId } = (
+        await admin
+          .post('/v1/admin/certificates')
+          .send({ name: 'شهادة موقّعة', trigger: 'MANUAL', width: 842, height: 595, elements: [{ id: 'sign', type: 'image', assetId, x: 100, y: 450, w: 160, h: 80 }] })
+          .expect(201)
+      ).body as { id: string };
+      const design = (await admin.get(`/v1/admin/certificates/${designId}`).expect(200)).body as { elements: { src?: string }[] };
+      expect(design.elements[0].src).toMatch(/^data:image\/png;base64,/);
+
+      // The student's certificate carries the signature's picture.
+      const room = await classroom();
+      await admin.post(`/v1/admin/certificates/${designId}/issue`).send({ studentIds: [room.student.id] }).expect(201);
+      const held = (await t.http().get('/v1/me/certificates').set(bearer(room.student.accessToken)).expect(200)).body as { id: string; title: string }[];
+      const copy = held.find(({ title }) => title === 'شهادة موقّعة');
+      const page = (await t.http().get(`/v1/me/certificates/${copy!.id}`).set(bearer(room.student.accessToken)).expect(200)).body as { elements: { type: string; src?: string }[] };
+      expect(page.elements[0]).toMatchObject({ type: 'image', src: expect.stringMatching(/^data:image\/png;base64,/) });
+
+      // A signature in use can't be deleted; once no design places it, it can.
+      await admin.delete(`/v1/admin/certificates/assets/${assetId}`).expect(409);
+      await admin.delete(`/v1/admin/certificates/${designId}`).expect(204);
+      await admin.delete(`/v1/admin/certificates/assets/${assetId}`).expect(204);
+      expect(await t.prisma.certificateAsset.count({ where: { id: assetId } })).toBe(0);
     });
   });
 
@@ -1186,6 +1640,19 @@ describe('program', () => {
       const report = (await admin.get('/v1/admin/reports/program').expect(200)).body as { scopes: { id: string }[] };
       expect(report.scopes.map(({ id }) => id)).toContain(scopeA);
     });
+
+    it('fills every section of the program report', async () => {
+      const room = await classroom();
+      await room.teacher.client.post('/v1/teacher/attendance').send({ studentId: room.student.id, attendance: 'PRESENT' }).expect(201);
+      const report = (await admin.get('/v1/admin/reports/program?days=30').expect(200)).body as ProgramReportBody;
+      expect(report.months).toHaveLength(6);
+      expect(report.totals.attendanceRate).not.toBeNull();
+      expect(report.attendance.present).toBeGreaterThanOrEqual(1);
+      expect(report.teachers.map(({ id }) => id)).toContain(room.teacher.id);
+      const circle = report.circles.find(({ id }) => id === room.circleId);
+      expect(circle).toMatchObject({ students: 1, attendanceRate: 100 });
+      expect(report.activity.newStudents).toBeGreaterThanOrEqual(1);
+    });
   });
 });
 
@@ -1209,6 +1676,14 @@ interface PlansBody {
 interface StageBody {
   stats: { tested: number };
   byCircle: object[];
+}
+interface ProgramReportBody {
+  totals: { attendanceRate: number | null };
+  months: object[];
+  attendance: { present: number };
+  teachers: { id: string }[];
+  circles: { id: string; students: number; attendanceRate: number | null }[];
+  activity: { newStudents: number };
 }
 interface OverviewBody {
   stats: { students: number };

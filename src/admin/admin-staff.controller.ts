@@ -1,5 +1,5 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post } from '@nestjs/common';
-import { CurrentStaff, Dashboard, Roles, type StaffActor } from '../auth/staff.decorators.js';
+import { CurrentStaff, Dashboard, Permissions, Roles, type StaffActor } from '../auth/staff.decorators.js';
 import { idSchema } from '../common/staff-api.js';
 import {
   type AssignStudentDto,
@@ -12,6 +12,7 @@ import { type MoveTeacherDto, moveTeacherSchema, type UpdateAdminCircleDto, upda
 
 @Dashboard()
 @Roles('ADMIN')
+@Permissions('accounts.manage')
 @Controller('admin')
 export class AdminStaffController {
   constructor(private readonly staff: AdminStaffService) {}

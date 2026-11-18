@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { BadgesService } from '../badges/badges.service.js';
 import { ApiError } from '../common/api-error.js';
 import { isUniqueViolation, riyadhDate } from '../common/staff-api.js';
 import { findSurah } from '../common/surahs.js';
@@ -6,6 +7,8 @@ import { PrismaService } from '../prisma/prisma.service.js';
 import { NotificationsService } from '../program/notifications.service.js';
 import { PlanService } from '../program/plan.service.js';
 import { SettingsService } from '../program/settings.service.js';
+import { ismaStateOf } from '../teacher/isma.service.js';
+import { isSupportKey, supportTicketOf } from '../common/support-keys.js';
 
 const MAX_WRAP_COUNT = 100;
 
@@ -17,6 +20,7 @@ export class StudentProgramService {
     private readonly plans: PlanService,
     private readonly settings: SettingsService,
     private readonly notifier: NotificationsService,
+    private readonly badgeService: BadgesService,
   ) {}
 
   async program(studentId: string) {
@@ -113,7 +117,7 @@ export class StudentProgramService {
       });
       await this.notifier.notifyTeacherOf(studentId, {
         type: 'GENERAL',
-        title: 'طلب جديد من طالبة',
+        title: 'طلب جديد من {{طالب|طالبة}}',
         body: dto.request,
         dedupeKey: `request:${request.id}`,
       });
@@ -130,14 +134,15 @@ export class StudentProgramService {
       where: { studentId, leftAt: null },
       select: {
         circleId: true,
-        circle: { select: { name: true, teacher: { select: { fullName: true } } } },
+        circle: { select: { name: true, teacher: { select: { id: true, fullName: true } } } },
       },
     });
     if (!membership) return null;
 
     const now = new Date();
     const today = riyadhDate();
-    const [tasks, evaluations, nextSession, attendance] = await Promise.all([
+    const teacherId = membership.circle.teacher?.id;
+    const [tasks, evaluations, nextSession, attendance, teacherBadges] = await Promise.all([
       this.prisma.task.findMany({
         where: {
           circleId: membership.circleId,
@@ -169,25 +174,42 @@ export class StudentProgramService {
         },
         // A session running now comes before an earlier one that was never started.
         orderBy: [{ status: 'desc' }, { scheduledAt: 'asc' }],
-        select: { id: true, kind: true, title: true, scheduledAt: true, status: true, studentId: true },
+        select: {
+          id: true,
+          kind: true,
+          title: true,
+          scheduledAt: true,
+          status: true,
+          studentId: true,
+          entryMode: true,
+          turns: { select: { studentId: true, position: true, status: true } },
+        },
       }),
       this.prisma.evaluation.findUnique({
         where: { studentId_attendanceOn: { studentId, attendanceOn: today } },
         select: { attendance: true },
       }),
+      teacherId ? this.badgeService.showcaseOf([teacherId]).then((map) => map.get(teacherId) ?? null) : null,
     ]);
 
     return {
       name: membership.circle.name,
       teacherName: membership.circle.teacher?.fullName ?? null,
+      /** The badges the teacher chose to show, so her students see them. */
+      teacherBadges,
       nextSession: nextSession && {
         id: nextSession.id,
         kind: nextSession.kind,
         title: nextSession.title,
         scheduledAt: nextSession.scheduledAt,
         status: nextSession.status,
-        /** A session for one student has a voice room. One for the whole circle doesn't. */
+        /** A session for one student has a voice room. One for the whole circle doesn't, except حلقة الإسماع. */
         individual: nextSession.studentId !== null,
+        /** In حلقة الإسماع: her place in the queue, once the session has started. */
+        isma:
+          nextSession.kind === 'ISMA'
+            ? { entryMode: nextSession.entryMode ?? 'OPEN', turn: ismaStateOf(nextSession.turns, studentId, nextSession.entryMode ?? 'OPEN') }
+            : null,
       },
       todayAttendance: attendance?.attendance ?? null,
       tasks: tasks.map(({ completions, ...task }) => ({
@@ -234,7 +256,18 @@ export class StudentProgramService {
       take: 50,
       select: { id: true, type: true, title: true, body: true, readAt: true, createdAt: true, dedupeKey: true },
     });
-    return rows.map(({ dedupeKey, ...row }) => ({ ...row, opens: dedupeKey?.startsWith('session') ? ('session' as const) : null }));
+    return rows.map(({ dedupeKey, ...row }) => ({
+      ...row,
+      opens: dedupeKey?.startsWith('session')
+        ? ('session' as const)
+        : dedupeKey?.startsWith('stage-exam')
+          ? ('stage-exam' as const)
+          : isSupportKey(dedupeKey)
+            ? ('support' as const)
+            : null,
+      /** The support conversation it opens, when it is about one. */
+      ticketId: supportTicketOf(dedupeKey),
+    }));
   }
 
   async markAllNotificationsRead(studentId: string): Promise<void> {
@@ -280,13 +313,12 @@ export class StudentProgramService {
     });
   }
 
-  async badges(studentId: string) {
-    const [all, earned] = await Promise.all([
-      this.prisma.badge.findMany({ select: { id: true, code: true, label: true, condition: true, icon: true } }),
-      this.prisma.studentBadge.findMany({ where: { studentId }, select: { badgeId: true, awardedAt: true } }),
-    ]);
-    const earnedAt = new Map(earned.map((row) => [row.badgeId, row.awardedAt]));
-    return all.map((badge) => ({ ...badge, awardedAt: earnedAt.get(badge.id) ?? null }));
+  badges(studentId: string) {
+    return this.badgeService.forStudent(studentId);
+  }
+
+  pinBadges(studentId: string, badgeIds: string[]) {
+    return this.badgeService.setPins(studentId, badgeIds);
   }
 
   /** Public settings the app reads at launch, with no account needed. */

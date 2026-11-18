@@ -1,9 +1,11 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Put, Query } from '@nestjs/common';
 import { z } from 'zod';
+import { type PinsDto, pinsSchema } from '../badges/badges.schemas.js';
 import { CurrentUserId } from '../auth/current-user.decorator.js';
 import { Public } from '../auth/public.decorator.js';
 import { idSchema, textField } from '../common/staff-api.js';
 import { VoiceService } from '../voice/voice.service.js';
+import { TrackChangeService } from '../program/track-change.service.js';
 import { StudentProgramService } from './student-program.service.js';
 import { StudentViewService } from './student-view.service.js';
 
@@ -14,10 +16,13 @@ const skipRequestSchema = z.strictObject({
   reason: textField(500),
 });
 
+const trackChangeSchema = z.strictObject({ trackCode: textField(40), reason: textField(500) });
+
 const languageCode = z.enum(['ar', 'en']);
 // A step's id, which is any non-negative whole number since a track sets its own steps.
 const stepParam = z.coerce.number().int().min(0).max(2_147_483_647);
 const stepSchema = z.strictObject({ done: z.boolean() });
+const sessionParam = z.coerce.number().int().min(1).max(4);
 const dayKindParam = z.enum(['REVIEW', 'WRAP', 'CONSOLIDATION']);
 const dayDetailSchema = z.strictObject({ detail: z.string().trim().max(300).optional() });
 const reflectionSchema = z.strictObject({ body: textField(4000) });
@@ -31,6 +36,7 @@ export class StudentProgramController {
     private readonly program: StudentProgramService,
     private readonly view: StudentViewService,
     private readonly voice: VoiceService,
+    private readonly trackChanges: TrackChangeService,
   ) {}
 
   @Get('dashboard')
@@ -48,6 +54,17 @@ export class StudentProgramController {
     await this.view.setStep(id, index, body.done);
   }
 
+  /** One of the day's sessions, numbered from 1, on a track that splits the day. */
+  @Post('wird/sessions/:number')
+  @HttpCode(204)
+  async setSession(
+    @CurrentUserId() id: string,
+    @Param('number', { schema: sessionParam }) number: number,
+    @Body({ schema: stepSchema }) body: { done: boolean },
+  ) {
+    await this.view.setSession(id, number, body.done);
+  }
+
   @Post('wird/repeat')
   @HttpCode(200)
   addRepeat(@CurrentUserId() id: string) {
@@ -58,6 +75,12 @@ export class StudentProgramController {
   @HttpCode(200)
   addReview(@CurrentUserId() id: string) {
     return this.view.addCount(id, 'REVIEW');
+  }
+
+  @Post('wird/listen')
+  @HttpCode(200)
+  addListen(@CurrentUserId() id: string) {
+    return this.view.addCount(id, 'LISTEN');
   }
 
   @Post('days/:kind/complete')
@@ -159,6 +182,24 @@ export class StudentProgramController {
     return this.program.createSkipRequest(id, body);
   }
 
+  /** The open request to change track, or the last one decided. */
+  @Get('track-change')
+  trackChange(@CurrentUserId() id: string) {
+    return this.trackChanges.latestFor(id);
+  }
+
+  /** Without a circle the track changes at once; in one, the request goes to the teacher. */
+  @Post('track-change')
+  requestTrackChange(@CurrentUserId() id: string, @Body({ schema: trackChangeSchema }) body: { trackCode: string; reason: string }) {
+    return this.trackChanges.request(id, body);
+  }
+
+  @Post('track-change/cancel')
+  @HttpCode(204)
+  async cancelTrackChange(@CurrentUserId() id: string) {
+    await this.trackChanges.cancel(id);
+  }
+
   @Get('circle')
   circle(@CurrentUserId() id: string) {
     return this.program.circle(id);
@@ -202,6 +243,13 @@ export class StudentProgramController {
   @Get('badges')
   badges(@CurrentUserId() id: string) {
     return this.program.badges(id);
+  }
+
+  /** The badges she shows on her profile, to herself, her teacher, her supervisor and the administration. */
+  @Put('badges/pins')
+  @HttpCode(204)
+  async pinBadges(@CurrentUserId() id: string, @Body({ schema: pinsSchema }) body: PinsDto) {
+    await this.program.pinBadges(id, body.badgeIds);
   }
 }
 

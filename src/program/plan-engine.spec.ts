@@ -1,7 +1,10 @@
 import { SURAHS } from '../common/surahs.js';
 import {
   convertCompletedUnits,
+  canSelfMark,
   firstOpenStep,
+  reviewRange,
+  sessionEventFinishes,
   absenceLevel,
   buildSteps,
   buildUnits,
@@ -11,8 +14,10 @@ import {
   countWirdDays,
   DEFAULT_WIRD_STEPS,
   delayLabel,
+  dueUnitsToday,
   type PlanRules,
   projectFinish,
+  sessionsOf,
   wirdConfigOf,
 } from './plan-engine.js';
 
@@ -55,6 +60,40 @@ describe('buildUnits', () => {
 
   it('gives one unit per surah for a surah-by-surah track', () => {
     expect(buildUnits('SURAH', ORDER)).toHaveLength(114);
+  });
+
+  it('counts ayahs a day over the whole Quran and over a juz range, each surah on its own', () => {
+    const whole = buildUnits('AYAHS', ORDER, [], 7);
+    for (const surah of SURAHS) {
+      const own = whole.filter((item) => item.surah === surah.number);
+      expect(own).toHaveLength(Math.ceil(surah.ayahCount / 7));
+      expect(own.every((item) => item.toAyah - item.fromAyah + 1 <= 7)).toBe(true);
+    }
+    // Juz' 30 runs from page 582 to the end, starting inside An-Naba.
+    const juz = buildUnits('AYAHS', ORDER, [582, 604], 5);
+    expect(juz.length).toBeGreaterThan(0);
+    expect(juz.every((item) => item.surah >= 78 && item.page >= 582)).toBe(true);
+  });
+});
+
+describe('sessionsOf', () => {
+  it('keeps the day whole without sessions', () => {
+    expect(sessionsOf({ fromAyah: 1, toAyah: 10 }, null)).toEqual([]);
+    expect(sessionsOf({ fromAyah: 1, toAyah: 10 }, 1)).toEqual([]);
+  });
+
+  it('splits the portion by ayahs, earlier sessions taking the extra', () => {
+    expect(sessionsOf({ fromAyah: 11, toAyah: 17 }, 2)).toEqual([
+      { number: 1, fromAyah: 11, toAyah: 14 },
+      { number: 2, fromAyah: 15, toAyah: 17 },
+    ]);
+    const three = sessionsOf({ fromAyah: 1, toAyah: 10 }, 3);
+    expect(three.map(({ fromAyah, toAyah }) => [fromAyah, toAyah])).toEqual([[1, 4], [5, 7], [8, 10]]);
+  });
+
+  it('has no more sessions than ayahs, and none for a single ayah', () => {
+    expect(sessionsOf({ fromAyah: 5, toAyah: 6 }, 4)).toHaveLength(2);
+    expect(sessionsOf({ fromAyah: 5, toAyah: 5 }, 3)).toEqual([]);
   });
 });
 
@@ -147,6 +186,32 @@ describe('computeProgress', () => {
     const short = buildUnits('SURAH', [112]);
     const rules: PlanRules = { ...page, dailyUnit: 'SURAH' };
     expect(computeProgress(short, rules, position(1), date('2030-01-01'))).toMatchObject({ expectedUnits: 1, progress: 100, commitment: 100 });
+  });
+});
+
+describe('dueUnitsToday', () => {
+  const units = buildUnits('PAGE', ORDER);
+  const position = (completedUnits: number, extra = {}) => ({ startOn: SUNDAY, completedUnits, creditedDays: 0, gateOpenedOn: null, ...extra });
+
+  it("counts today's own portion", () => {
+    expect(dueUnitsToday(units, page, position(0), SUNDAY)).toBe(1);
+  });
+
+  it('carries a missed wird day over to the next', () => {
+    // Sunday missed: Monday's wird is Sunday's portion and Monday's.
+    expect(dueUnitsToday(units, page, position(0), date('2026-11-09'))).toBe(2);
+    expect(dueUnitsToday(units, page, position(0), date('2026-11-11'))).toBe(4);
+  });
+
+  it('adds nothing on a day off, so what is owed waits for the next wird day', () => {
+    // Thursday is the last wird day of the week: Friday and Saturday owe the same five.
+    expect(dueUnitsToday(units, page, position(0), date('2026-11-13'))).toBe(5);
+    expect(dueUnitsToday(units, page, position(0), date('2026-11-14'))).toBe(5);
+    expect(dueUnitsToday(units, page, position(0), date('2026-11-15'))).toBe(6);
+  });
+
+  it('stops the clock while a gate waits', () => {
+    expect(dueUnitsToday(units, page, position(2, { gateOpenedOn: date('2026-11-10') }), date('2026-11-25'))).toBe(3);
   });
 
   it('reports progress through the whole track', () => {
@@ -281,8 +346,8 @@ describe('convertCompletedUnits', () => {
 });
 
 describe('the wird steps', () => {
-  const config = { steps: DEFAULT_WIRD_STEPS, repeatTarget: 3, reviewTarget: 2 };
-  const counts = (doneSteps: number[] = [], repeatCount = 0, reviewCount = 0) => ({ doneSteps, repeatCount, reviewCount });
+  const config = { steps: DEFAULT_WIRD_STEPS, recitationMode: 'LIVE' as const, repeatTarget: 3, reviewTarget: 2, listenTarget: 2 };
+  const counts = (doneSteps: number[] = [], repeatCount = 0, reviewCount = 0, listenCount = 0) => ({ doneSteps, repeatCount, reviewCount, listenCount });
 
   it('starts past the review when there is nothing before the first portion', () => {
     expect(firstOpenStep(counts(), config, false)?.id).toBe(1);
@@ -292,13 +357,78 @@ describe('the wird steps', () => {
   it('finishes a counted step only at its target, however it was ticked', () => {
     expect(firstOpenStep(counts([0], 0, 1), config, true)?.id).toBe(0);
     expect(firstOpenStep(counts([], 0, 2), config, true)?.id).toBe(1);
-    expect(firstOpenStep(counts([1, 2, 3, 4], 2, 2), config, true)?.id).toBe(4);
+    expect(firstOpenStep(counts([2, 3, 6, 4], 2, 2, 2), config, true)?.id).toBe(4);
+  });
+
+  it('waits on the teacher for the session step before the repetition', () => {
+    expect(firstOpenStep(counts([2, 3], 3, 2, 2), config, true)?.id).toBe(6);
+    expect(firstOpenStep(counts([2, 3, 6], 0, 2, 2), config, true)?.id).toBe(4);
+  });
+
+  it('finishes a session step by what its track counts', () => {
+    expect(sessionEventFinishes('ATTENDED', { kind: 'ENDED' })).toBe(true);
+    expect(sessionEventFinishes('EVALUATED', { kind: 'ENDED' })).toBe(false);
+    expect(sessionEventFinishes('EVALUATED', { kind: 'EVALUATED', mastered: false, via: 'SESSION' })).toBe(true);
+    expect(sessionEventFinishes('MASTERED', { kind: 'EVALUATED', mastered: false, via: 'SESSION' })).toBe(false);
+    expect(sessionEventFinishes('MASTERED', { kind: 'EVALUATED', mastered: true, via: 'SESSION' })).toBe(true);
+  });
+
+  it('finishes a recording track’s session step only by an evaluated recording', () => {
+    const recording = { kind: 'EVALUATED', mastered: false, via: 'RECORDING' } as const;
+    expect(sessionEventFinishes('EVALUATED', recording, 'RECORDING')).toBe(true);
+    // No session to attend: ATTENDED waits for the recording's evaluation instead.
+    expect(sessionEventFinishes('ATTENDED', recording, 'RECORDING')).toBe(true);
+    expect(sessionEventFinishes('ATTENDED', { kind: 'ENDED' }, 'RECORDING')).toBe(false);
+    expect(sessionEventFinishes('EVALUATED', { ...recording, via: 'SESSION' }, 'RECORDING')).toBe(false);
+    expect(sessionEventFinishes('EVALUATED', { ...recording, via: 'DIRECT' }, 'RECORDING')).toBe(false);
+    expect(sessionEventFinishes('MASTERED', recording, 'RECORDING')).toBe(false);
+    expect(sessionEventFinishes('MASTERED', { ...recording, mastered: true }, 'RECORDING')).toBe(true);
+    expect(sessionEventFinishes('EVALUATED', recording, 'NONE')).toBe(false);
+  });
+
+  it('leaves the session step out of a track that recites by neither', () => {
+    const template = { wirdSteps: null, repeatTarget: 3, reviewTarget: 2, listenTarget: 2 };
+    expect(wirdConfigOf(template).steps.some(({ kind }) => kind === 'SESSION')).toBe(true);
+    expect(wirdConfigOf({ ...template, recitationMode: 'RECORDING' }).steps.some(({ kind }) => kind === 'SESSION')).toBe(true);
+    const none = wirdConfigOf({ ...template, recitationMode: 'NONE' });
+    expect(none.steps.some(({ kind }) => kind === 'SESSION')).toBe(false);
+    expect(none.steps).toHaveLength(DEFAULT_WIRD_STEPS.length - 1);
+    // Without the teacher's step, repetition opens as soon as the memorizing is done.
+    expect(firstOpenStep(counts([2, 3], 0, 2, 2), none, true)?.id).toBe(4);
+  });
+
+  it('lets a student mark only the steps her track allows', () => {
+    const session = { id: 1, kind: 'SESSION' as const, title: '', subtitle: '' };
+    expect(canSelfMark(session)).toBe(false);
+    expect(canSelfMark({ ...session, options: { selfConfirm: true } })).toBe(true);
+    expect(canSelfMark({ ...session, kind: 'REPEAT' })).toBe(false);
+    expect(canSelfMark({ ...session, kind: 'REPEAT', options: { optional: true } })).toBe(true);
+    expect(canSelfMark({ ...session, kind: 'TASK' })).toBe(true);
+  });
+
+  it('counts a skipped step done only when its track makes it optional', () => {
+    const steps = [{ id: 7, kind: 'REPEAT' as const, title: '', subtitle: '', options: { optional: true } }];
+    expect(firstOpenStep(counts([7]), { ...config, steps }, true)).toBeNull();
+    expect(firstOpenStep(counts([7]), { ...config, steps: [{ ...steps[0], options: {} }] }, true)?.id).toBe(7);
+  });
+
+  it('reviews several portions before the current one, within one surah', () => {
+    const units = [{ surah: 1 }, { surah: 2 }, { surah: 2 }, { surah: 2 }, { surah: 2 }];
+    expect(reviewRange(units, 4, 2)).toEqual([units[2], units[3]]);
+    expect(reviewRange(units, 2, 3)).toEqual([units[1]]);
+    expect(reviewRange(units, 0, 3)).toEqual([]);
+  });
+
+  it('finishes listening only after the sheikh is heard as many times as the track asks', () => {
+    expect(firstOpenStep(counts([1], 0, 2, 0), config, true)?.id).toBe(1);
+    expect(firstOpenStep(counts([], 0, 2, 1), config, true)?.id).toBe(1);
+    expect(firstOpenStep(counts([], 0, 2, 2), config, true)?.id).toBe(2);
   });
 
   it('leaves a task open until its own button is pressed', () => {
-    expect(firstOpenStep(counts([1], 3, 2), config, true)?.id).toBe(2);
-    expect(firstOpenStep(counts([1, 2, 3], 3, 2), config, true)?.id).toBe(5);
-    expect(firstOpenStep(counts([1, 2, 3, 5], 3, 2), config, true)).toBeNull();
+    expect(firstOpenStep(counts([], 3, 2, 2), config, true)?.id).toBe(2);
+    expect(firstOpenStep(counts([2, 3, 6], 3, 2, 2), config, true)?.id).toBe(5);
+    expect(firstOpenStep(counts([2, 3, 6, 5], 3, 2, 2), config, true)).toBeNull();
   });
 
   it('follows a track\'s own list and targets', () => {
@@ -306,9 +436,10 @@ describe('the wird steps', () => {
       wirdSteps: [{ id: 90, kind: 'TASK', title: 'مهمة', subtitle: '' }],
       repeatTarget: 1,
       reviewTarget: 1,
+      listenTarget: 1,
     });
     expect(firstOpenStep(counts(), custom, true)?.id).toBe(90);
     expect(firstOpenStep(counts([90]), custom, true)).toBeNull();
-    expect(wirdConfigOf({ wirdSteps: null, repeatTarget: 35, reviewTarget: 5 }).steps).toBe(DEFAULT_WIRD_STEPS);
+    expect(wirdConfigOf({ wirdSteps: null, repeatTarget: 35, reviewTarget: 5, listenTarget: 1 }).steps).toBe(DEFAULT_WIRD_STEPS);
   });
 });

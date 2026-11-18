@@ -5,7 +5,7 @@ import { AuthCleanupService } from './auth-cleanup.service.js';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';
 import { OriginGuard } from './origin.guard.js';
-import { ConsoleOtpDelivery, OtpDelivery } from './otp-delivery.js';
+import { AuthenticaOtpDelivery, ConsoleOtpDelivery, OtpDelivery } from './otp-delivery.js';
 import { OtpService } from './otp.service.js';
 import { LeakedPasswordChecker, PasswordService } from './password.service.js';
 import { StaffAuthController } from './staff-auth.controller.js';
@@ -27,7 +27,12 @@ import { TotpService } from './totp.service.js';
     PasswordService,
     TotpService,
     StaffAuthService,
-    { provide: OtpDelivery, useClass: ConsoleOtpDelivery },
+    {
+      provide: OtpDelivery,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) =>
+        config.get('OTP_DELIVERY') === 'authentica' ? new AuthenticaOtpDelivery(config) : new ConsoleOtpDelivery(),
+    },
     {
       provide: StaffMailer,
       inject: [ConfigService],

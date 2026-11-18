@@ -1,11 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { StaffAuthService } from '../auth/staff-auth.service.js';
-import type { StaffActor } from '../auth/staff.decorators.js';
+import { isAdministrationRole, type StaffActor } from '../auth/staff.decorators.js';
 import { TokensService } from '../auth/tokens.service.js';
 import { ApiError } from '../common/api-error.js';
+import { assertStudentsOfSection, assertTrackFitsSection } from '../common/sections.js';
 import { isUniqueViolation, pageArgs } from '../common/staff-api.js';
 import { AuditService } from '../prisma/audit.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { NotificationsService } from '../program/notifications.service.js';
 import { PlanService } from '../program/plan.service.js';
 import { assertOpenTrack } from '../supervisor/circle-track.js';
 import type {
@@ -28,7 +30,9 @@ export const STAFF_SELECT = {
   phone: true,
   role: true,
   status: true,
+  section: true,
   scope: { select: { id: true, name: true } },
+  rank: { select: { id: true, name: true } },
   createdAt: true,
   staffCredential: { select: { passwordHash: true, totpEnabledAt: true } },
 } as const;
@@ -40,7 +44,9 @@ type StaffRow = {
   phone: string | null;
   role: string;
   status: string;
+  section: string;
   scope: { id: string; name: string } | null;
+  rank: { id: string; name: string } | null;
   createdAt: Date;
   staffCredential: { passwordHash: string | null; totpEnabledAt: Date | null } | null;
 };
@@ -64,12 +70,24 @@ export class AdminService {
     private readonly staffAuth: StaffAuthService,
     private readonly tokens: TokensService,
     private readonly plans: PlanService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async listStaff(query: ListStaffDto) {
     const where = {
       role: query.role ?? { not: 'STUDENT' as const },
       ...(query.scopeId ? { scopeId: query.scopeId } : {}),
+      ...(query.status ? { status: query.status } : {}),
+      ...(query.section ? { section: query.section } : {}),
+      ...(query.search
+        ? {
+            OR: [
+              { fullName: { contains: query.search, mode: 'insensitive' as const } },
+              { email: { contains: query.search, mode: 'insensitive' as const } },
+              { phone: { contains: query.search.replace(/[\s-]/g, '') } },
+            ],
+          }
+        : {}),
     };
     const [total, items] = await Promise.all([
       this.prisma.user.count({ where }),
@@ -114,10 +132,14 @@ export class AdminService {
 
   /** Accounts have no password until their owner sets one, through the single-use link returned here. */
   async createStaff(admin: StaffActor, dto: CreateStaffDto) {
+    // Only an administrator makes administration accounts, so no employee can make one above their own rank.
+    if (admin.role !== 'ADMIN' && isAdministrationRole(dto.role)) throw new ApiError(403, 'forbidden');
+    if (dto.rankId) await this.assertRank(dto.rankId);
     if (dto.scopeId) await this.assertScope(dto.scopeId);
     if (dto.circleId) {
       const free = await this.prisma.circle.findFirst({ where: { id: dto.circleId, scopeId: dto.scopeId, teacherId: null, archivedAt: null }, select: { id: true } });
       if (!free) throw new ApiError(409, 'circle_not_free');
+      await assertStudentsOfSection(this.prisma, dto.circleId, dto.section);
     }
     try {
       const user = await this.prisma.user.create({
@@ -126,7 +148,9 @@ export class AdminService {
           email: dto.email,
           phone: dto.phone,
           role: dto.role,
+          section: dto.section,
           scopeId: dto.scopeId,
+          rankId: dto.rankId,
           staffCredential: { create: {} },
         },
         select: STAFF_SELECT,
@@ -140,7 +164,7 @@ export class AdminService {
         }
       }
       const setup = await this.staffAuth.issueSetupToken(user.id);
-      await this.audit.record(admin, 'staff.create', { type: 'user', id: user.id }, { role: dto.role });
+      await this.audit.record(admin, 'staff.create', { type: 'user', id: user.id }, { role: dto.role, rankId: dto.rankId ?? null });
       return { staff: toStaff(user), ...setup };
     } catch (error) {
       if (isUniqueViolation(error)) throw new ApiError(409, 'identity_taken');
@@ -150,11 +174,27 @@ export class AdminService {
 
   async updateStaff(admin: StaffActor, staffId: string, dto: UpdateStaffDto) {
     // Stops an administrator from locking out the last way in by accident.
-    if (staffId === admin.id && dto.status) throw new ApiError(409, 'cannot_change_own_account');
-    const staff = await this.staffOrThrow(staffId);
+    if (staffId === admin.id && (dto.status || dto.role || dto.rankId)) throw new ApiError(409, 'cannot_change_own_account');
+    const staff = await this.staffOrThrow(staffId, admin);
+    const roleChanged = dto.role !== undefined && dto.role !== staff.role;
+
+    if (dto.rankId !== undefined) {
+      if (staff.role !== 'EMPLOYEE') throw new ApiError(400, 'only_employees_have_rank');
+      await this.assertRank(dto.rankId);
+    }
+    if (roleChanged) {
+      if (isAdministrationRole(staff.role)) throw new ApiError(409, 'admin_role_fixed');
+      // A supervisor has no circle of her own, so a teacher hands hers over first.
+      const circles = await this.prisma.circle.count({ where: { teacherId: staffId, archivedAt: null } });
+      if (circles > 0) throw new ApiError(409, 'teacher_has_circles');
+    }
+    // An account keeps at least one way to sign in.
+    const email = dto.email === undefined ? staff.email : dto.email;
+    const phone = dto.phone === undefined ? staff.phone : dto.phone;
+    if (!email && !phone) throw new ApiError(400, 'identity_required');
 
     if (dto.scopeId) {
-      if (staff.role === 'ADMIN') throw new ApiError(400, 'admin_has_no_scope');
+      if (isAdministrationRole(staff.role)) throw new ApiError(400, 'admin_has_no_scope');
       await this.assertScope(dto.scopeId);
       if (dto.scopeId !== staff.scopeId) {
         const circles = await this.prisma.circle.count({ where: { teacherId: staffId, archivedAt: null } });
@@ -165,16 +205,31 @@ export class AdminService {
       const circles = await this.prisma.circle.count({ where: { teacherId: staffId, archivedAt: null } });
       if (circles > 0) throw new ApiError(409, 'teacher_has_circles');
     }
+    // Her circles' students are of her section, so the section moves only when they are all of the new one,
+    // as when an account was filed under the wrong section. An empty circle moves with her.
+    if (dto.section && dto.section !== staff.section) {
+      const circles = await this.prisma.circle.findMany({ where: { teacherId: staffId, archivedAt: null }, select: { id: true } });
+      for (const { id } of circles) await assertStudentsOfSection(this.prisma, id, dto.section);
+    }
 
     try {
       const updated = await this.prisma.user.update({ where: { id: staffId }, data: dto, select: STAFF_SELECT });
-      if (dto.status === 'SUSPENDED') await this.tokens.revokeAllForUser(staffId);
+      // A new role signs in again, so a new supervisor meets the two-step check her role requires.
+      if (dto.status === 'SUSPENDED' || roleChanged) await this.tokens.revokeAllForUser(staffId);
       // Which contact details changed, not their values.
       await this.audit.record(
         admin,
         'staff.update',
         { type: 'user', id: staffId },
-        { status: dto.status ?? null, scopeId: dto.scopeId ?? null, emailChanged: dto.email !== undefined, phoneChanged: dto.phone !== undefined },
+        {
+          status: dto.status ?? null,
+          role: roleChanged ? dto.role : null,
+          scopeId: dto.scopeId ?? null,
+          section: dto.section ?? null,
+          rankId: dto.rankId !== undefined && dto.rankId !== staff.rankId ? dto.rankId : null,
+          emailChanged: dto.email !== undefined,
+          phoneChanged: dto.phone !== undefined,
+        },
       );
       return toStaff(updated);
     } catch (error) {
@@ -183,10 +238,29 @@ export class AdminService {
     }
   }
 
+  /**
+   * For an account made by mistake or no longer needed. Her past records stay, without her name on them,
+   * so suspending is the choice whenever she may come back.
+   */
+  async deleteStaff(admin: StaffActor, staffId: string): Promise<void> {
+    if (staffId === admin.id) throw new ApiError(409, 'cannot_change_own_account');
+    const staff = await this.staffOrThrow(staffId, admin);
+    if (staff.role === 'ADMIN') throw new ApiError(409, 'admin_role_fixed');
+    const circles = await this.prisma.circle.count({ where: { teacherId: staffId, archivedAt: null } });
+    if (circles > 0) throw new ApiError(409, 'teacher_has_circles');
+
+    await this.prisma.$transaction([
+      // Archived circles keep their teacher for the record, which would otherwise block the delete.
+      this.prisma.circle.updateMany({ where: { teacherId: staffId }, data: { teacherId: null } }),
+      this.prisma.user.delete({ where: { id: staffId } }),
+    ]);
+    await this.audit.record(admin, 'staff.delete', { type: 'user', id: staffId }, { role: staff.role });
+  }
+
   /** For a forgotten password or a lost authenticator: both are cleared, and a new setup link is issued. */
   async resetStaffCredentials(admin: StaffActor, staffId: string) {
     if (staffId === admin.id) throw new ApiError(409, 'cannot_change_own_account');
-    await this.staffOrThrow(staffId);
+    await this.staffOrThrow(staffId, admin);
 
     await this.prisma.staffCredential.upsert({
       where: { userId: staffId },
@@ -272,8 +346,9 @@ export class AdminService {
 
   /** The student signs in with this number by code. They accept the pledges when they first complete sign-up. */
   async createStudent(admin: StaffActor, dto: CreateStudentDto) {
-    const track = await this.prisma.trackTemplate.findFirst({ where: { id: dto.trackId, active: true }, select: { id: true, code: true } });
+    const track = await this.prisma.trackTemplate.findFirst({ where: { id: dto.trackId, active: true }, select: { id: true, code: true, recitationMode: true } });
     if (!track) throw new ApiError(409, 'track_closed');
+    assertTrackFitsSection(track.recitationMode, dto.section);
     const original = { advanced: 'ADVANCED', steady: 'STEADY', stabilization: 'STABILIZATION' } as const;
     try {
       const student = await this.prisma.user.create({
@@ -281,6 +356,8 @@ export class AdminService {
           fullName: dto.fullName,
           phone: dto.phone,
           country: dto.country,
+          region: dto.region ?? null,
+          city: dto.city ?? null,
           section: dto.section,
           trackTemplateId: track.id,
           trackId: original[track.code as keyof typeof original] ?? null,
@@ -336,12 +413,6 @@ export class AdminService {
     return circle;
   }
 
-  async setStudentStatus(admin: StaffActor, studentId: string, status: 'ACTIVE' | 'SUSPENDED'): Promise<void> {
-    const { count } = await this.prisma.user.updateMany({ where: { id: studentId, role: 'STUDENT' }, data: { status } });
-    if (count !== 1) throw notFound();
-    if (status === 'SUSPENDED') await this.tokens.revokeAllForUser(studentId);
-    await this.audit.record(admin, 'student.set_status', { type: 'student', id: studentId }, { status });
-  }
 
   async listTransfers(query: ListTransfersDto) {
     const where = { status: query.status };
@@ -388,15 +459,27 @@ export class AdminService {
     const { count } = await this.prisma.transferRequest.updateMany({ where: { id, status: 'PENDING_ADMIN' }, data: { status } });
     if (count !== 1) throw notFound();
     await this.audit.record(admin, action, { type: 'transfer', id });
+    if (status === 'PENDING_TEACHER') await this.notifications.transferAwaitsTeacher(id);
+    else await this.notifications.transferDecided(id, false);
   }
 
-  private async staffOrThrow(staffId: string) {
+  /**
+   * The account an action is on. An employee manages teachers and supervisors only: never an administrator's
+   * account or another employee's, which would let them raise their own rank or reach past it.
+   */
+  private async staffOrThrow(staffId: string, actor: StaffActor) {
     const staff = await this.prisma.user.findFirst({
       where: { id: staffId, role: { not: 'STUDENT' } },
-      select: { id: true, role: true, scopeId: true },
+      select: { id: true, role: true, scopeId: true, section: true, email: true, phone: true, rankId: true },
     });
     if (!staff) throw notFound();
+    if (actor.role !== 'ADMIN' && isAdministrationRole(staff.role)) throw new ApiError(403, 'forbidden');
     return staff;
+  }
+
+  private async assertRank(rankId: string): Promise<void> {
+    const rank = await this.prisma.staffRank.findUnique({ where: { id: rankId }, select: { id: true } });
+    if (!rank) throw new ApiError(404, 'rank_not_found');
   }
 
   async assertScope(scopeId: string): Promise<void> {

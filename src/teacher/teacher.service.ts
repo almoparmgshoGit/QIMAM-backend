@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import type { StaffActor } from '../auth/staff.decorators.js';
 import { ApiError } from '../common/api-error.js';
-import { attendanceRate, isUniqueViolation, pageArgs, riyadhDate, riyadhDayStart } from '../common/staff-api.js';
+import { ATTENDANCE_DAY, attendanceRate, isUniqueViolation, pageArgs, riyadhDate, riyadhDayStart } from '../common/staff-api.js';
 import { findSurah, SURAHS } from '../common/surahs.js';
 import type { AttendanceStatus } from '../generated/prisma/enums.js';
 import { AuditService } from '../prisma/audit.service.js';
@@ -10,6 +10,7 @@ import { PlanService, type PlanSummary } from '../program/plan.service.js';
 import { NotificationsService } from '../program/notifications.service.js';
 import { SettingsService } from '../program/settings.service.js';
 import { VoiceService } from '../voice/voice.service.js';
+import { IsmaService } from './isma.service.js';
 import type {
   AttendanceDto,
   AttendanceSheetDto,
@@ -22,9 +23,13 @@ import type {
   ListStudentsDto,
   ListTasksDto,
   ReportQueryDto,
+  UpdateRecitationDto,
 } from './teacher.schemas.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** What was recited and how it went. Attendance is null for a recording heard after the day it was sent. */
+export type EvaluationInput = Omit<EvaluateSessionDto, 'attendance'> & { attendance: EvaluateSessionDto['attendance'] | null };
 // Allows for a slow request when scheduling something that starts now.
 const SCHEDULE_GRACE_MS = 5 * 60 * 1000;
 
@@ -44,6 +49,7 @@ export class TeacherService {
     private readonly settings: SettingsService,
     private readonly notifications: NotificationsService,
     private readonly voice: VoiceService,
+    private readonly isma: IsmaService,
   ) {}
 
   surahs() {
@@ -59,12 +65,17 @@ export class TeacherService {
     });
     const studentIds = members.map(({ student }) => student.id);
 
-    const recordedToday = await this.prisma.evaluation.findMany({
-      where: { studentId: { in: studentIds }, surah: { not: null }, createdAt: { gte: riyadhDayStart() } },
-      distinct: ['studentId'],
-      select: { studentId: true },
-    });
-    const recorded = new Set(recordedToday.map(({ studentId }) => studentId));
+    // A student has recorded today's wird when a unit of the plan was done today, by her or through a recitation
+    // the teacher heard, or when she completed the day's review or consolidation. A skipped surah isn't a wird.
+    const today = riyadhDate();
+    const [wirdToday, daysToday] = await Promise.all([
+      this.prisma.wirdLog.findMany({
+        where: { doneOn: today, source: { in: ['STUDENT', 'TEACHER'] }, plan: { studentId: { in: studentIds } } },
+        select: { plan: { select: { studentId: true } } },
+      }),
+      this.prisma.dayCompletion.findMany({ where: { studentId: { in: studentIds }, doneOn: today }, select: { studentId: true } }),
+    ]);
+    const recorded = new Set([...wirdToday.map(({ plan }) => plan.studentId), ...daysToday.map(({ studentId }) => studentId)]);
     const summaries = await this.plans.summaries(studentIds);
 
     const tasks = await this.listTasks(teacher, {});
@@ -123,7 +134,7 @@ export class TeacherService {
       this.prisma.evaluation.groupBy({ by: ['studentId'], where: { studentId: { in: ids } }, _max: { createdAt: true } }),
       this.prisma.evaluation.groupBy({
         by: ['studentId', 'attendance'],
-        where: { studentId: { in: ids }, attendance: { not: null } },
+        where: { studentId: { in: ids }, ...ATTENDANCE_DAY },
         _count: true,
       }),
     ]);
@@ -147,6 +158,17 @@ export class TeacherService {
   async studentProfile(teacher: StaffActor, studentId: string) {
     const membership = await this.memberOrThrow(teacher.id, studentId);
     const { openRecord } = await this.settings.get('permissions');
+    // With the record closed, a teacher sees only what was recorded in this circle.
+    return {
+      ...(await this.studentFile(studentId, openRecord ? null : membership.circleId)),
+      circle: membership.circle,
+      joinedAt: membership.joinedAt,
+    };
+  }
+
+  /** A student's progress, attendance and recitations. Callers check access first; a circle id limits the recitations and attendance to it. */
+  async studentFile(studentId: string, onlyCircleId: string | null) {
+    const circleLimit = onlyCircleId ? { circleId: onlyCircleId } : {};
     const [student, attendance, evaluations, summaries, week, gates, repeatedlyAbsent] = await Promise.all([
       this.prisma.user.findUniqueOrThrow({
         where: { id: studentId },
@@ -155,12 +177,11 @@ export class TeacherService {
       }),
       this.prisma.evaluation.groupBy({
         by: ['studentId', 'attendance'],
-        where: { studentId, attendance: { not: null } },
+        where: { studentId, ...ATTENDANCE_DAY, ...circleLimit },
         _count: true,
       }),
-      // With the record closed, a teacher sees only what was recorded in this circle.
       this.prisma.evaluation.findMany({
-        where: { studentId, ...(openRecord ? {} : { circleId: membership.circleId }) },
+        where: { studentId, ...circleLimit },
         orderBy: { createdAt: 'desc' },
         take: 20,
       }),
@@ -177,8 +198,6 @@ export class TeacherService {
       country: student.country,
       track: student.trackTemplate?.name ?? null,
       trackStart: student.trackStart?.toLowerCase() ?? null,
-      circle: membership.circle,
-      joinedAt: membership.joinedAt,
       attendance: {
         present: counts.PRESENT ?? 0,
         late: counts.LATE ?? 0,
@@ -197,6 +216,63 @@ export class TeacherService {
   async createRecitation(teacher: StaffActor, { studentId, ...fields }: CreateRecitationDto) {
     const { circleId } = await this.memberOrThrow(teacher.id, studentId);
     return toEvaluation(await this.saveEvaluation(teacher, studentId, circleId, fields));
+  }
+
+  /** Corrects a recitation this teacher saved, for a student still in her circle. */
+  async updateRecitation(teacher: StaffActor, id: string, dto: UpdateRecitationDto) {
+    const row = await this.ownRecitation(teacher, id);
+    // An absent student recited nothing, so there is nothing to score.
+    if (row.attendance === 'ABSENT' && (dto.score !== undefined || (dto.segmentStatus ?? null) !== null)) {
+      throw new ApiError(409, 'student_was_absent');
+    }
+    const updated = await this.prisma.evaluation.update({
+      where: { id },
+      data: {
+        ...(dto.score !== undefined ? { score: dto.score } : {}),
+        ...(dto.note !== undefined ? { comment: dto.note || null } : {}),
+        ...(dto.segmentStatus !== undefined ? { segmentStatus: dto.segmentStatus } : {}),
+      },
+    });
+    await this.audit.record(teacher, 'evaluation.update', { type: 'student', id: row.studentId }, {
+      evaluationId: id,
+      scoreFrom: row.score === null ? null : Number(row.score),
+      scoreTo: dto.score ?? null,
+      noteChanged: dto.note !== undefined,
+    });
+    return toEvaluation(updated);
+  }
+
+  /**
+   * Removes a recitation saved by mistake. A recitation that also holds the day's attendance keeps the
+   * attendance and loses only what was recited. Plan progress it already advanced stays.
+   */
+  async deleteRecitation(teacher: StaffActor, id: string): Promise<void> {
+    const row = await this.ownRecitation(teacher, id);
+    // A recording this evaluation answered goes back to wait for a new one.
+    await this.prisma.recitationRecording.updateMany({ where: { evaluationId: id }, data: { evaluationId: null, reviewedAt: null } });
+    if (row.attendanceOn) {
+      await this.prisma.evaluation.update({
+        where: { id },
+        data: { title: 'حضور', surah: null, fromAyah: null, toAyah: null, score: null, comment: null, segmentStatus: null, liveSessionId: null },
+      });
+    } else {
+      await this.prisma.evaluation.delete({ where: { id } });
+    }
+    await this.audit.record(teacher, 'evaluation.delete', { type: 'student', id: row.studentId }, { surah: row.surah, fromAyah: row.fromAyah, toAyah: row.toAyah });
+  }
+
+  private async ownRecitation(teacher: StaffActor, id: string) {
+    const row = await this.prisma.evaluation.findFirst({
+      where: {
+        id,
+        teacherId: teacher.id,
+        surah: { not: null },
+        student: { memberships: { some: { leftAt: null, circle: { teacherId: teacher.id, archivedAt: null } } } },
+      },
+      select: { studentId: true, attendance: true, attendanceOn: true, score: true, surah: true, fromAyah: true, toAyah: true },
+    });
+    if (!row) throw notFound();
+    return row;
   }
 
   /** Attendance with nothing recited. It counts towards attendance, and is not a recitation. Saving again corrects the day's record. */
@@ -364,7 +440,7 @@ export class TeacherService {
   }
 
   async listSessions(teacher: StaffActor, query: ListSessionsDto) {
-    const where = { teacherId: teacher.id, ...(query.kind ? { kind: query.kind } : {}) };
+    const where = { teacherId: teacher.id, ...(query.kind ? { kind: { in: query.kind } } : {}) };
     const [total, items] = await Promise.all([
       this.prisma.liveSession.count({ where }),
       this.prisma.liveSession.findMany({ where, ...pageArgs(query), orderBy: { scheduledAt: 'desc' }, include: SESSION_INCLUDE }),
@@ -388,27 +464,63 @@ export class TeacherService {
     const circleId = dto.studentId
       ? (await this.memberOrThrow(teacher.id, dto.studentId)).circleId
       : await this.resolveCircle(teacher.id, dto.circleId);
+    // A student recites in a voice session only on a track that recites online.
+    if (dto.kind === 'RECITATION' && dto.studentId) {
+      const student = await this.prisma.user.findUnique({
+        where: { id: dto.studentId },
+        select: { section: true, trackTemplate: { select: { recitationMode: true } } },
+      });
+      if ((student?.trackTemplate?.recitationMode ?? 'LIVE') !== 'LIVE') throw new ApiError(409, 'track_has_no_live_recitation');
+      // Online recitation is for the women's section only.
+      if (student?.section === 'MEN') throw new ApiError(409, 'live_recitation_women_only');
+    }
 
     const session = await this.prisma.liveSession.create({
-      data: { kind: dto.kind, title: dto.title, scheduledAt, circleId, teacherId: teacher.id, studentId: dto.studentId ?? null },
+      data: {
+        kind: dto.kind,
+        title: dto.title,
+        scheduledAt,
+        circleId,
+        teacherId: teacher.id,
+        studentId: dto.studentId ?? null,
+        entryMode: dto.kind === 'ISMA' ? (dto.entryMode ?? 'OPEN') : null,
+      },
       include: SESSION_INCLUDE,
     });
     return toSession(session);
   }
 
   async startSession(teacher: StaffActor, id: string) {
-    const started = await this.moveSession(teacher, id, 'SCHEDULED', { status: 'IN_PROGRESS', startedAt: new Date() });
+    await this.moveSession(teacher, id, 'SCHEDULED', { status: 'IN_PROGRESS', startedAt: new Date() });
     const session = await this.prisma.liveSession.findUniqueOrThrow({
       where: { id },
-      select: { id: true, title: true, studentId: true, circleId: true },
+      select: { id: true, title: true, studentId: true, circleId: true, kind: true },
     });
-    await this.notifications.sessionStarted(session);
-    return started;
+    // An isma session tells each student her own place in the queue instead.
+    if (session.kind === 'ISMA' && session.circleId) await this.isma.openQueue(session.id, session.circleId, session.title);
+    else await this.notifications.sessionStarted(session);
+    return this.getSession(teacher, id);
   }
 
   async endSession(teacher: StaffActor, id: string) {
     const session = await this.moveSession(teacher, id, 'IN_PROGRESS', { status: 'COMPLETED', endedAt: new Date() });
     this.voice.endRoom(id);
+    // A recitation heard in a voice session finishes the wird's session step, where the track counts attending.
+    const ended = await this.prisma.liveSession.findUniqueOrThrow({
+      where: { id },
+      select: { kind: true, studentId: true, circleId: true, startedAt: true },
+    });
+    if (ended.kind === 'RECITATION' && ended.studentId) await this.plans.markSessionStep(ended.studentId, { kind: 'ENDED' });
+    if (ended.kind === 'ISMA' && ended.circleId) {
+      const { unmarkedPresent, recited } = await this.isma.close(id);
+      const day = riyadhDate(ended.startedAt ?? new Date());
+      // Whoever came in and was never marked, was there.
+      for (const studentId of unmarkedPresent) {
+        await this.markAttendance(teacher, studentId, ended.circleId, 'PRESENT', day);
+      }
+      await this.prisma.ismaTurn.updateMany({ where: { sessionId: id, studentId: { in: unmarkedPresent } }, data: { attendance: 'PRESENT' } });
+      for (const studentId of recited) await this.plans.markSessionStep(studentId, { kind: 'ENDED' });
+    }
     return session;
   }
 
@@ -425,7 +537,11 @@ export class TeacherService {
     const { circleId } = await this.memberOrThrow(teacher.id, session.studentId);
 
     try {
-      const evaluation = await this.saveEvaluation(teacher, session.studentId, circleId, dto, session.id);
+      // The attendance belongs to the day the session took place, even when it is evaluated later.
+      const evaluation = await this.saveEvaluation(teacher, session.studentId, circleId, dto, {
+        liveSessionId: session.id,
+        day: riyadhDate(session.startedAt ?? session.scheduledAt),
+      });
       await this.prisma.liveSession.update({ where: { id: session.id }, data: { attendance: dto.attendance } });
       return toEvaluation(evaluation);
     } catch (error) {
@@ -458,7 +574,7 @@ export class TeacherService {
     const [attendance, scores] = await Promise.all([
       this.prisma.evaluation.groupBy({
         by: ['studentId', 'attendance'],
-        where: { studentId: { in: ids }, createdAt: { gte: since }, attendance: { not: null } },
+        where: { studentId: { in: ids }, createdAt: { gte: since }, ...ATTENDANCE_DAY },
         _count: true,
       }),
       this.prisma.evaluation.groupBy({
@@ -536,6 +652,7 @@ export class TeacherService {
       await tx.circleMembership.create({ data: { studentId: transfer.studentId, circleId: transfer.toCircleId } });
     });
     await this.audit.record(teacher, 'transfer.accept', { type: 'transfer', id: transfer.id }, { studentId: transfer.studentId });
+    await this.notifications.transferDecided(transfer.id, true);
   }
 
   async rejectTransfer(teacher: StaffActor, transferId: string): Promise<void> {
@@ -546,6 +663,7 @@ export class TeacherService {
     });
     if (count !== 1) throw new ApiError(409, 'invalid_transfer_state');
     await this.audit.record(teacher, 'transfer.reject', { type: 'transfer', id: transfer.id }, { studentId: transfer.studentId });
+    await this.notifications.transferDecided(transfer.id, false);
   }
 
   private async incomingTransfer(teacher: StaffActor, transferId: string) {
@@ -557,26 +675,32 @@ export class TeacherService {
     return transfer;
   }
 
-  /** Students whose last three attendance records are all absences. */
+  /** Students whose last three attendance days are all absences. Each student's own three, however many records the others have. */
   private async repeatedlyAbsent(studentIds: string[]): Promise<Set<string>> {
-    const rows = await this.prisma.evaluation.findMany({
-      where: { studentId: { in: studentIds }, attendance: { not: null } },
-      orderBy: { createdAt: 'desc' },
-      take: studentIds.length * 20,
-      select: { studentId: true, attendance: true },
+    if (studentIds.length === 0) return new Set();
+    const students = await this.prisma.user.findMany({
+      where: { id: { in: studentIds } },
+      select: {
+        id: true,
+        evaluationsGot: { where: ATTENDANCE_DAY, orderBy: { attendanceOn: 'desc' }, take: 3, select: { attendance: true } },
+      },
     });
-    const recent = new Map<string, (AttendanceStatus | null)[]>();
-    for (const row of rows) {
-      const list = recent.get(row.studentId) ?? [];
-      if (list.length < 3) list.push(row.attendance);
-      recent.set(row.studentId, list);
-    }
-    return new Set([...recent].filter(([, list]) => list.length === 3 && list.every((value) => value === 'ABSENT')).map(([id]) => id));
+    return new Set(
+      students
+        .filter(({ evaluationsGot: days }) => days.length === 3 && days.every(({ attendance }) => attendance === 'ABSENT'))
+        .map(({ id }) => id),
+    );
   }
 
-  /** The date in the key keeps one record per student per day, however many times it is saved. */
-  private attendanceUpsert(teacherId: string, studentId: string, circleId: string, attendance: AttendanceStatus) {
-    const attendanceOn = riyadhDate();
+  /** The day's attendance of one student, from inside a session. It shows on the attendance sheet at once. */
+  async markAttendance(teacher: StaffActor, studentId: string, circleId: string, attendance: AttendanceStatus, day: Date): Promise<void> {
+    await this.attendanceUpsert(teacher.id, studentId, circleId, attendance, day);
+    await this.audit.record(teacher, 'attendance.record', { type: 'student', id: studentId }, { attendance });
+    await this.notifications.checkAbsence(studentId);
+  }
+
+  /** The date in the key keeps one record per student per day, however many times it is saved. A later record of the day replaces it. */
+  private attendanceUpsert(teacherId: string, studentId: string, circleId: string, attendance: AttendanceStatus, attendanceOn = riyadhDate()) {
     return this.prisma.evaluation.upsert({
       where: { studentId_attendanceOn: { studentId, attendanceOn } },
       create: { studentId, teacherId, circleId, title: 'حضور', attendance, attendanceOn },
@@ -611,32 +735,46 @@ export class TeacherService {
     return membership;
   }
 
-  private async saveEvaluation(
+  /**
+   * Saves a recitation's evaluation. Callers check access first. A null attendance is for a recording the student
+   * sent from the app: it was heard later, so it says nothing about the day's attendance.
+   */
+  async saveEvaluation(
     teacher: StaffActor,
     studentId: string,
     circleId: string,
-    dto: EvaluateSessionDto,
-    liveSessionId?: string,
+    dto: EvaluationInput,
+    {
+      liveSessionId,
+      day = riyadhDate(),
+      fromRecording = false,
+    }: { liveSessionId?: string; day?: Date; fromRecording?: boolean } = {},
   ) {
     const surah = findSurah(dto.surah);
     if (!surah || dto.toAyah > surah.ayahCount) throw new ApiError(400, 'ayah_out_of_range');
 
-    const evaluation = await this.prisma.evaluation.create({
-      data: {
-        studentId,
-        teacherId: teacher.id,
-        circleId,
-        liveSessionId,
-        title: `${surah.name} · ${dto.fromAyah}-${dto.toAyah}`,
-        surah: dto.surah,
-        fromAyah: dto.fromAyah,
-        toAyah: dto.toAyah,
-        score: dto.score,
-        comment: dto.note || null,
-        segmentStatus: dto.segmentStatus,
-        attendance: dto.attendance,
-      },
-    });
+    // The recitation, and the day's attendance it implies, together. Attendance is counted from the day's
+    // record alone, so a recitation and the attendance sheet on the same day count once.
+    const attendance = dto.attendance;
+    const [evaluation] = await this.prisma.$transaction([
+      this.prisma.evaluation.create({
+        data: {
+          studentId,
+          teacherId: teacher.id,
+          circleId,
+          liveSessionId,
+          title: `${surah.name} · ${dto.fromAyah}-${dto.toAyah}`,
+          surah: dto.surah,
+          fromAyah: dto.fromAyah,
+          toAyah: dto.toAyah,
+          score: dto.score,
+          comment: dto.note || null,
+          segmentStatus: dto.segmentStatus,
+          attendance,
+        },
+      }),
+      ...(attendance ? [this.attendanceUpsert(teacher.id, studentId, circleId, attendance, day)] : []),
+    ]);
     await this.audit.record(
       teacher,
       'evaluation.create',
@@ -646,12 +784,20 @@ export class TeacherService {
     if (dto.attendance !== 'ABSENT') {
       await this.notifications.send([studentId], {
         type: 'EVALUATION',
-        title: 'تقييم جديد من معلمتك',
+        title: 'تقييم جديد من {{معلمك|معلمتك}}',
         body: dto.note ? `${evaluation.title}: ${dto.note}` : evaluation.title,
         dedupeKey: `evaluation:${evaluation.id}`,
       });
     }
-    await this.notifications.checkAbsence(studentId);
+    if (attendance) await this.notifications.checkAbsence(studentId);
+    // Before the plan can move on, so the step lands on the portion that was recited.
+    if (dto.attendance !== 'ABSENT') {
+      await this.plans.markSessionStep(studentId, {
+        kind: 'EVALUATED',
+        mastered: dto.segmentStatus === 'MASTERED',
+        via: fromRecording ? 'RECORDING' : liveSessionId ? 'SESSION' : 'DIRECT',
+      });
+    }
     if (dto.attendance !== 'ABSENT' && dto.segmentStatus === 'MASTERED') {
       await this.plans.advanceFromEvaluation(studentId, dto.surah, dto.fromAyah, dto.toAyah);
     }
@@ -679,12 +825,13 @@ export class TeacherService {
 
 const SESSION_INCLUDE = {
   student: { select: { id: true, fullName: true } },
+  circle: { select: { id: true, name: true } },
   evaluations: { select: { id: true } },
 } as const;
 
 type SessionRow = {
   id: string;
-  kind: 'RECITATION' | 'CORRECTION';
+  kind: 'RECITATION' | 'CORRECTION' | 'ISMA';
   title: string;
   notes: string | null;
   scheduledAt: Date;
@@ -694,6 +841,8 @@ type SessionRow = {
   startedAt: Date | null;
   endedAt: Date | null;
   student: { id: string; fullName: string } | null;
+  circle: { id: string; name: string } | null;
+  entryMode: 'OPEN' | 'TURN' | null;
   evaluations: { id: string }[];
 };
 
@@ -712,6 +861,9 @@ function toSession(session: SessionRow) {
     /** Null means the whole circle. */
     student: session.student && { id: session.student.id, name: session.student.fullName },
     evaluated: session.evaluations.length > 0,
+    circle: session.circle,
+    /** An isma session's: who may be in the room. */
+    entryMode: session.entryMode,
   };
 }
 

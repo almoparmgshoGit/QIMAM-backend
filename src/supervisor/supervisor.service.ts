@@ -1,12 +1,15 @@
 import { Injectable } from '@nestjs/common';
 import type { StaffActor } from '../auth/staff.decorators.js';
 import { ApiError } from '../common/api-error.js';
-import { attendanceRate, isUniqueViolation } from '../common/staff-api.js';
+import { ATTENDANCE_DAY, attendanceRate, isUniqueViolation } from '../common/staff-api.js';
+import { assertTeacherFitsCircle } from '../common/sections.js';
 import { findSurah } from '../common/surahs.js';
 import type { AttendanceStatus } from '../generated/prisma/enums.js';
 import { AuditService } from '../prisma/audit.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { PlanService } from '../program/plan.service.js';
+import { SettingsService } from '../program/settings.service.js';
+import { TeacherProgramService } from '../teacher/teacher-program.service.js';
 import { TeacherService } from '../teacher/teacher.service.js';
 import { assertOpenTrack, assertStudentFitsCircle } from './circle-track.js';
 import type {
@@ -42,6 +45,8 @@ export class SupervisorService {
     private readonly audit: AuditService,
     private readonly plans: PlanService,
     private readonly teachers: TeacherService,
+    private readonly teacherProgram: TeacherProgramService,
+    private readonly settings: SettingsService,
   ) {}
 
   home(staff: StaffActor) {
@@ -99,7 +104,10 @@ export class SupervisorService {
     const circle = await this.circleInScope(scopeId, circleId);
 
     const teacherChanged = dto.teacherId !== undefined && dto.teacherId !== circle.teacherId;
-    if (dto.teacherId && teacherChanged) await this.assertAvailableTeacher(scopeId, dto.teacherId);
+    if (dto.teacherId && teacherChanged) {
+      await this.assertAvailableTeacher(scopeId, dto.teacherId);
+      await assertTeacherFitsCircle(this.prisma, circleId, dto.teacherId);
+    }
     if (dto.capacity !== undefined) {
       const size = await this.prisma.circleMembership.count({ where: { circleId, leftAt: null } });
       if (dto.capacity < size) throw new ApiError(409, 'capacity_below_students');
@@ -188,6 +196,37 @@ export class SupervisorService {
       circles: circles.map(({ _count, trackTemplate, ...circle }) => ({ ...circle, track: trackTemplate, students: _count.memberships })),
       students: roster.items,
     };
+  }
+
+  /**
+   * A student in one of the scope's circles: plan, attendance, recitations and record, as the teacher sees them.
+   * With the record closed, what was recorded in other circles stays out, as it does for the teacher.
+   */
+  async studentFile(staff: StaffActor, studentId: string) {
+    const membership = await this.memberInScope(staff, studentId);
+    const { openRecord } = await this.settings.get('permissions');
+    const { teacher, ...circle } = membership.circle;
+    return {
+      ...(await this.teachers.studentFile(studentId, openRecord ? null : membership.circleId)),
+      circle: { ...circle, teacher: teacher && { id: teacher.id, name: teacher.fullName } },
+      joinedAt: membership.joinedAt,
+    };
+  }
+
+  /** The parts of the file the summary leaves out: what was memorized, recitations, exams, attendance and tasks. */
+  async studentRecord(staff: StaffActor, studentId: string) {
+    const membership = await this.memberInScope(staff, studentId);
+    const { openRecord } = await this.settings.get('permissions');
+    return this.teacherProgram.recordOf(studentId, membership.circleId, !openRecord);
+  }
+
+  private async memberInScope(staff: StaffActor, studentId: string) {
+    const membership = await this.prisma.circleMembership.findFirst({
+      where: { studentId, leftAt: null, circle: { scopeId: this.scopeOf(staff), archivedAt: null } },
+      select: { circleId: true, joinedAt: true, circle: { select: { id: true, name: true, teacher: { select: { id: true, fullName: true } } } } },
+    });
+    if (!membership) throw notFound();
+    return membership;
   }
 
   async updateTeacher(staff: StaffActor, teacherId: string, dto: UpdateTeacherDto): Promise<void> {
@@ -486,7 +525,7 @@ export class SupervisorService {
       this.prisma.circleMembership.findMany({ where: { circleId: { in: ids }, leftAt: null }, select: { circleId: true, studentId: true } }),
       this.prisma.evaluation.groupBy({
         by: ['circleId', 'attendance'],
-        where: { circleId: { in: ids }, createdAt: { gte: since }, attendance: { not: null } },
+        where: { circleId: { in: ids }, createdAt: { gte: since }, ...ATTENDANCE_DAY },
         _count: true,
       }),
       this.prisma.evaluation.groupBy({

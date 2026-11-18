@@ -12,7 +12,12 @@ const envSchema = z
     JWT_PRIVATE_KEY_BASE64: z.string().min(100),
     JWT_KEY_ID: z.string().regex(/^[A-Za-z0-9_-]{1,20}$/),
     OTP_PEPPER: z.string().min(32),
-    OTP_DELIVERY: z.enum(['console']),
+    OTP_DELIVERY: z.enum(['console', 'authentica']),
+    /** Required for authentica delivery. From the application's page in the Authentica portal. */
+    AUTHENTICA_API_KEY: z.string().min(10).optional(),
+    AUTHENTICA_METHOD: z.enum(['sms', 'whatsapp']).default('sms'),
+    /** The message template in the Authentica portal. Authentica uses template 1 when unset. */
+    AUTHENTICA_TEMPLATE_ID: z.coerce.number().int().positive().optional(),
     MAIL_DELIVERY: z.enum(['console', 'smtp']).default('console'),
     /** Such as smtps://user:pass@mail.example.com. Required for smtp delivery. */
     SMTP_URL: z.string().optional(),
@@ -26,6 +31,8 @@ const envSchema = z
     TOTP_ENCRYPTION_KEY: z
       .string()
       .refine((value) => Buffer.from(value, 'base64').length === 32, 'must be 32 bytes in base64'),
+    /** Where uploaded files are kept: badge pictures, certificate backgrounds and recordings, each in its own folder. */
+    UPLOADS_DIR: z.string().min(1).default('uploads'),
     /** Address or range of the reverse proxy, or "false" when there is none. */
     TRUST_PROXY: z.string().default('false'),
     /** Comma-separated. Helps two devices find a direct path for a voice call. */
@@ -37,6 +44,8 @@ const envSchema = z
     TURN_URLS: z.string().transform(commaList).optional(),
     /** The server's static-auth-secret, from which short-lived call credentials are made. */
     TURN_SECRET: z.string().min(16).optional(),
+    /** Needed only when "enhanced push security" is turned on for the project in Expo. */
+    EXPO_ACCESS_TOKEN: z.string().min(10).optional(),
   })
   .superRefine((env, ctx) => {
     if (Boolean(env.TURN_URLS?.length) !== Boolean(env.TURN_SECRET)) {
@@ -44,6 +53,9 @@ const envSchema = z
     }
     if (env.MAIL_DELIVERY === 'smtp' && (!env.SMTP_URL || !env.MAIL_FROM)) {
       ctx.addIssue({ code: 'custom', path: ['SMTP_URL'], message: 'smtp delivery needs SMTP_URL and MAIL_FROM' });
+    }
+    if (env.OTP_DELIVERY === 'authentica' && !env.AUTHENTICA_API_KEY) {
+      ctx.addIssue({ code: 'custom', path: ['AUTHENTICA_API_KEY'], message: 'authentica delivery needs AUTHENTICA_API_KEY' });
     }
     // A recovery link in the log would let anyone reading it take over an account.
     if (env.NODE_ENV === 'production' && env.MAIL_DELIVERY === 'console') {

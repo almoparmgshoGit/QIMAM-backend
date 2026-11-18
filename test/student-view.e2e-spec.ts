@@ -3,7 +3,7 @@ import { generateSync } from 'otplib';
 import request from 'supertest';
 import { randomId } from '../src/common/ids.js';
 import { Prisma } from '../src/generated/prisma/client.js';
-import { createTestApp, register, type TestApp, finishWirdSteps, trackIdOf } from './helpers.js';
+import { createTestApp, nextWirdDay, register, type TestApp, finishWirdSteps, trackIdOf } from './helpers.js';
 
 const ORIGIN = 'http://localhost:3000';
 const PASSWORD = 'Sturdy-Pass-9271-xyz';
@@ -25,6 +25,7 @@ interface PlanBody {
   week: { kind: string; state: string }[];
   weekSummary: { done: number; total: number };
   todayDone: { wird: boolean; kinds: string[] };
+  wirdDoneToday: boolean;
   gate: object | null;
   commitment: number | null;
   progress: number;
@@ -96,11 +97,23 @@ describe('the student\'s own app data', () => {
     await finishWirdSteps(t, accessToken);
     await t.http().post('/v1/me/wird/complete').set(bearer(accessToken)).expect(204);
     const after = (await dashboard(accessToken)).plan;
-    expect(after.steps.every(({ done }) => !done)).toBe(true);
-    expect(after.previous).toMatchObject({ surah: 18, fromAyah: 1 });
     expect(after.todayDone.wird).toBe(true);
     expect(after.weekSummary.done).toBeGreaterThan(0);
     expect(after.streak).toBe(1);
+
+    // The wird is daily: the rest of today shows today's portion finished, and tomorrow's stays shut.
+    expect(after.wirdDoneToday).toBe(true);
+    expect(after.next).toMatchObject({ surah: 18, fromAyah: 1 });
+    expect(after.steps.every(({ done }) => done)).toBe(true);
+    expect((await t.http().post('/v1/me/wird/complete').set(bearer(accessToken)).expect(409)).body).toMatchObject({ code: 'wird_done_today' });
+    expect((await t.http().post('/v1/me/wird/steps/1').set(bearer(accessToken)).send({ done: true }).expect(409)).body).toMatchObject({ code: 'wird_done_today' });
+    expect((await t.http().post('/v1/me/wird/review').set(bearer(accessToken)).expect(409)).body).toMatchObject({ code: 'wird_done_today' });
+
+    await nextWirdDay(t, accessToken);
+    const tomorrow = (await dashboard(accessToken)).plan;
+    expect(tomorrow.wirdDoneToday).toBe(false);
+    expect(tomorrow.steps.every(({ done }) => !done)).toBe(true);
+    expect(tomorrow.previous).toMatchObject({ surah: 18, fromAyah: 1 });
   });
 
   it('holds the steps to their order, and refuses a wird with steps left', async () => {
@@ -126,6 +139,7 @@ describe('the student\'s own app data', () => {
 
     await finishWirdSteps(t, accessToken);
     await t.http().post('/v1/me/wird/complete').set(bearer(accessToken)).expect(204);
+    await nextWirdDay(t, accessToken);
     // The next step waits for the review, however it's asked for.
     expect((await t.http().post('/v1/me/wird/steps/1').set(bearer(accessToken)).send({ done: true }).expect(409)).body).toMatchObject({ code: 'wird_step_locked' });
 

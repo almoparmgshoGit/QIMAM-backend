@@ -14,8 +14,10 @@ export class AuditService {
     target: { type: string; id: string },
     metadata?: Prisma.InputJsonObject,
   ): Promise<void> {
+    // What an admin does from inside another account is kept as theirs too.
+    const fullMetadata = actor.impersonatorId ? { ...metadata, impersonatedBy: actor.impersonatorId } : metadata;
     await this.prisma.auditLog.create({
-      data: { actorId: actor.id, actorRole: actor.role, action, targetType: target.type, targetId: target.id, metadata },
+      data: { actorId: actor.id, actorRole: actor.role, action, targetType: target.type, targetId: target.id, metadata: fullMetadata },
     });
   }
 }

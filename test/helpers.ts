@@ -26,7 +26,10 @@ export async function createTestApp({ rateLimits = false } = {}): Promise<TestAp
   const mails: StaffMail[] = [];
   let builder = Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(OtpDelivery)
-    .useValue({ deliver: (phone: string, code: string) => Promise.resolve(void sent.push({ phone, code })) })
+    .useValue({
+      providerIssuesCodes: false,
+      deliver: (phone: string, code: string) => Promise.resolve(void sent.push({ phone, code })),
+    })
     .overrideProvider(StaffMailer)
     .useValue({ send: (mail: StaffMail) => Promise.resolve(void mails.push(mail)) })
     // No call to the outside service during tests. One known password stands in for a breached one.
@@ -65,6 +68,7 @@ export const REGISTRATION = {
   fullName: 'نورة محمد العتيبي',
   country: 'السعودية',
   ageBand: '19',
+  section: 'women',
   trackId: 'steady',
   trackStart: null,
   pledgesAccepted: true,
@@ -88,12 +92,18 @@ export function keepStaffSignedIn(agents: () => ReturnType<typeof request.agent>
   });
 }
 
-export async function register(t: TestApp, phone = newPhone()) {
+/**
+ * Signs a student up. A woman is put on the REGISTRATION track, as an older copy of the app does. A man signs up
+ * with no track: the REGISTRATION one recites online, which is for the women's section only.
+ */
+export async function register(t: TestApp, phone = newPhone(), section: 'women' | 'men' = 'women') {
   await t.http().post('/v1/auth/otp/request').send({ phone, purpose: 'register' }).expect(202);
+  const { trackId: _trackId, trackStart: _trackStart, ...withoutTrack } = REGISTRATION;
+  const registration = section === 'men' ? { ...withoutTrack, section } : { ...REGISTRATION, section };
   const { body } = await t
     .http()
     .post('/v1/auth/otp/verify')
-    .send({ phone, code: t.codeFor(phone), registration: REGISTRATION })
+    .send({ phone, code: t.codeFor(phone), registration })
     .expect(200);
   return { phone, ...(body as { accessToken: string; refreshToken: string; expiresIn: number }) };
 }
@@ -103,12 +113,26 @@ export async function passCooldown(t: TestApp, phone: string): Promise<void> {
   await t.prisma.otpChallenge.updateMany({ where: { phone }, data: { createdAt: new Date(Date.now() - 2 * 60 * 1000) } });
 }
 
+/** Moves the student's finished wirds back a day, in place of waiting for tomorrow's wird to open. */
+export async function nextWirdDay(t: TestApp, token: string): Promise<void> {
+  const { body } = await t.http().get('/v1/me').set({ Authorization: `Bearer ${token}` });
+  const plan = await t.prisma.studentPlan.findUniqueOrThrow({ where: { studentId: (body as { id: string }).id }, select: { id: true } });
+  const logs = await t.prisma.wirdLog.findMany({ where: { planId: plan.id }, select: { unitIndex: true, doneOn: true } });
+  for (const { unitIndex, doneOn } of logs) {
+    await t.prisma.wirdLog.update({
+      where: { planId_unitIndex: { planId: plan.id, unitIndex } },
+      data: { doneOn: new Date(doneOn.getTime() - 86_400_000) },
+    });
+  }
+}
+
 /** Marks every step of the student's current unit done, as a student would before finishing their wird. */
 export async function finishWirdSteps(t: TestApp, token: string): Promise<void> {
   const { body } = await t.http().get('/v1/me').set({ Authorization: `Bearer ${token}` });
   const plan = await t.prisma.studentPlan.findUnique({ where: { studentId: (body as { id: string }).id } });
   if (!plan) return;
   const key = { planId: plan.id, unitIndex: plan.completedUnits };
-  const done = { doneSteps: [1, 2, 3, 5], repeatCount: 35, reviewCount: 5 };
+  // Listening counts its plays like repeating does, so its target is met by count, not by its step id.
+  const done = { doneSteps: [1, 2, 3, 5, 6], repeatCount: 35, reviewCount: 5, listenCount: 100 };
   await t.prisma.wirdProgress.upsert({ where: { planId_unitIndex: key }, create: { ...key, ...done }, update: done });
 }

@@ -3,8 +3,11 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import { ApiError } from '../common/api-error.js';
+import { forSection } from '../common/sections.js';
+import { AuditService } from '../prisma/audit.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { PasswordService } from './password.service.js';
+import { PERMISSIONS } from './permissions.js';
 import { StaffMailer } from './staff-mailer.js';
 import type {
   ChangePasswordDto,
@@ -12,7 +15,8 @@ import type {
   SetPasswordDto,
   StaffLoginDto,
 } from './staff-auth.schemas.js';
-import { type TokenPair, TokensService } from './tokens.service.js';
+import type { StaffActor } from './staff.decorators.js';
+import { IMPERSONATION_TICKET_SECONDS, IMPERSONATION_TOKEN_SECONDS, type TokenPair, TokensService } from './tokens.service.js';
 import { TotpService } from './totp.service.js';
 
 const MAX_FAILURES = 5;
@@ -39,6 +43,7 @@ export class StaffAuthService {
     private readonly passwords: PasswordService,
     private readonly tokens: TokensService,
     private readonly totp: TotpService,
+    private readonly auditLog: AuditService,
   ) {}
 
   /** A wrong email, wrong password, suspended account and locked account all answer the same. */
@@ -128,9 +133,10 @@ export class StaffAuthService {
   private async sendRecoveryLink(email: string): Promise<void> {
     const user = await this.prisma.user.findFirst({
       where: { email, role: { not: 'STUDENT' }, status: 'ACTIVE' },
-      select: { id: true, fullName: true, email: true },
+      select: { id: true, fullName: true, email: true, section: true },
     });
     if (!user?.email) return;
+    const say = (text: string) => forSection(text, user.section);
 
     const { setupToken } = await this.issueSetupToken(user.id, RECOVERY_TOKEN_MS);
     const origin = this.config.getOrThrow<string[]>('ADMIN_ORIGINS')[0];
@@ -140,9 +146,9 @@ export class StaffAuthService {
       subject: 'استعادة كلمة المرور - برنامج قمم',
       text: [
         `مرحبًا ${user.fullName}،`,
-        'لتعيين كلمة مرور جديدة افتح الرابط التالي خلال ساعة:',
+        say('لتعيين كلمة مرور جديدة {{افتح|افتحي}} الرابط التالي خلال ساعة:'),
         `${origin}/set-password?token=${encodeURIComponent(setupToken)}`,
-        'إن لم تطلب ذلك فتجاهل هذه الرسالة، وستبقى كلمة مرورك كما هي.',
+        say('إن لم {{تطلب|تطلبي}} ذلك {{فتجاهل|فتجاهلي}} هذه الرسالة، وستبقى كلمة مرورك كما هي.'),
       ].join('\n\n'),
     });
   }
@@ -173,6 +179,45 @@ export class StaffAuthService {
     await this.audit(record.userId, 'staff.password_set');
   }
 
+  /**
+   * An admin opens a teacher's or supervisor's dashboard in a private window: this gives the one-time link to paste
+   * there. The account's password and second step are not needed, since the admin passed their own. It is tied to the
+   * admin's session and recorded.
+   */
+  async impersonate(admin: StaffActor, targetId: string, refreshToken: string | undefined) {
+    const session = refreshToken ? await this.tokens.liveFamilyOf(refreshToken) : null;
+    if (session?.userId !== admin.id) throw new ApiError(401, 'invalid_token');
+
+    const target = await this.prisma.user.findUnique({ where: { id: targetId }, select: { role: true, status: true } });
+    if (target?.role !== 'TEACHER' && target?.role !== 'SUPERVISOR') throw new ApiError(404, 'not_found');
+    if (target.status !== 'ACTIVE') throw new ApiError(409, 'account_suspended');
+
+    const ticket = await this.tokens.issueImpersonationTicket({ userId: targetId, actorId: admin.id, familyId: session.familyId });
+    await this.auditLog.record(admin, 'staff.impersonate', { type: 'user', id: targetId }, { role: target.role });
+    return { ticket, expiresAt: new Date(Date.now() + IMPERSONATION_TICKET_SECONDS * 1000).toISOString() };
+  }
+
+  /** Run in the private window: spends the link and starts the session, checking both accounts again. */
+  async redeemImpersonation(ticket: string) {
+    const claims = await this.tokens.redeemImpersonationTicket(ticket);
+    const [target, admin, sessionLive] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: claims.userId }, select: { role: true, status: true } }),
+      this.prisma.user.findUnique({ where: { id: claims.actorId }, select: { role: true, status: true } }),
+      this.tokens.isFamilyLive(claims.familyId, claims.actorId),
+    ]);
+    const targetFits = target?.status === 'ACTIVE' && (target.role === 'TEACHER' || target.role === 'SUPERVISOR');
+    if (!targetFits || admin?.status !== 'ACTIVE' || admin.role !== 'ADMIN' || !sessionLive) throw new ApiError(401, 'invalid_ticket');
+
+    const token = await this.tokens.issueImpersonationToken(claims);
+    return { token, expiresAt: new Date(Date.now() + IMPERSONATION_TOKEN_SECONDS * 1000).toISOString() };
+  }
+
+  /** The admin behind an impersonated session, shown in that window so it is never mistaken for the account's own. */
+  async impersonator(adminId: string) {
+    const admin = await this.prisma.user.findUnique({ where: { id: adminId }, select: { id: true, fullName: true } });
+    return admin ? { id: admin.id, name: admin.fullName } : null;
+  }
+
   async changePassword(userId: string, { currentPassword, newPassword }: ChangePasswordDto): Promise<TokenPair> {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId }, include: { staffCredential: true } });
     const credential = user.staffCredential;
@@ -200,9 +245,11 @@ export class StaffAuthService {
         fullName: true,
         email: true,
         role: true,
+        section: true,
         scope: { select: { id: true, name: true } },
         taughtCircles: { where: { archivedAt: null }, select: { id: true, name: true } },
         staffCredential: { select: { totpEnabledAt: true } },
+        rank: { select: { id: true, name: true, permissions: true } },
       },
     });
     return {
@@ -210,9 +257,14 @@ export class StaffAuthService {
       name: user.fullName,
       email: user.email,
       role: user.role,
+      section: user.section,
       scope: user.scope,
       circles: user.taughtCircles,
       totpEnabled: Boolean(user.staffCredential?.totpEnabledAt),
+      // The dashboard shows an employee only the sections their rank opens. The API checks each request itself.
+      rank: user.rank
+        ? { id: user.rank.id, name: user.rank.name, permissions: user.rank.permissions.filter((key) => Object.hasOwn(PERMISSIONS, key)) }
+        : null,
     };
   }
 
