@@ -50,6 +50,18 @@ const envSchema = z
     TURN_URLS: z.string().transform(commaList).optional(),
     /** The server's static-auth-secret, from which short-lived call credentials are made. */
     TURN_SECRET: z.string().min(16).optional(),
+    /**
+     * iPhone notifications straight to Apple, without Expo: the team's APNs key (.p8) from developer.apple.com.
+     * Set all three or none. The key's PEM text in base64.
+     */
+    APNS_KEY_ID: z.string().regex(/^[A-Z0-9]{10}$/).optional(),
+    APNS_TEAM_ID: z.string().regex(/^[A-Z0-9]{10}$/).optional(),
+    APNS_PRIVATE_KEY_BASE64: z
+      .string()
+      .refine((value) => Buffer.from(value, 'base64').toString('utf8').includes('BEGIN PRIVATE KEY'), 'must be the .p8 file in base64')
+      .optional(),
+    /** The app's bundle id. */
+    APNS_TOPIC: z.string().default('com.qimam.quran'),
     /** Needed only when "enhanced push security" is turned on for the project in Expo. */
     EXPO_ACCESS_TOKEN: z.string().min(10).optional(),
   })
@@ -59,6 +71,9 @@ const envSchema = z
     }
     if (Boolean(env.REVIEW_PHONE) !== Boolean(env.REVIEW_CODE)) {
       ctx.addIssue({ code: 'custom', path: ['REVIEW_CODE'], message: 'REVIEW_PHONE and REVIEW_CODE go together' });
+    }
+    if (new Set([Boolean(env.APNS_KEY_ID), Boolean(env.APNS_TEAM_ID), Boolean(env.APNS_PRIVATE_KEY_BASE64)]).size > 1) {
+      ctx.addIssue({ code: 'custom', path: ['APNS_KEY_ID'], message: 'APNS_KEY_ID, APNS_TEAM_ID and APNS_PRIVATE_KEY_BASE64 go together' });
     }
     if (env.MAIL_DELIVERY === 'smtp' && (!env.SMTP_URL || !env.MAIL_FROM)) {
       ctx.addIssue({ code: 'custom', path: ['SMTP_URL'], message: 'smtp delivery needs SMTP_URL and MAIL_FROM' });
