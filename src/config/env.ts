@@ -18,6 +18,12 @@ const envSchema = z
     AUTHENTICA_METHOD: z.enum(['sms', 'whatsapp']).default('sms'),
     /** The message template in the Authentica portal. Authentica uses template 1 when unset. */
     AUTHENTICA_TEMPLATE_ID: z.coerce.number().int().positive().optional(),
+    /**
+     * App Review sign-in. One number, in international form such as +966500000000, that signs in with a fixed
+     * code and no SMS. Set both or neither; leave them unset unless a review is running.
+     */
+    REVIEW_PHONE: z.string().regex(/^\+[1-9]\d{7,14}$/).optional(),
+    REVIEW_CODE: z.string().regex(/^\d{4}$/).optional(),
     MAIL_DELIVERY: z.enum(['console', 'smtp']).default('console'),
     /** Such as smtps://user:pass@mail.example.com. Required for smtp delivery. */
     SMTP_URL: z.string().optional(),
@@ -50,6 +56,9 @@ const envSchema = z
   .superRefine((env, ctx) => {
     if (Boolean(env.TURN_URLS?.length) !== Boolean(env.TURN_SECRET)) {
       ctx.addIssue({ code: 'custom', path: ['TURN_SECRET'], message: 'TURN_URLS and TURN_SECRET go together' });
+    }
+    if (Boolean(env.REVIEW_PHONE) !== Boolean(env.REVIEW_CODE)) {
+      ctx.addIssue({ code: 'custom', path: ['REVIEW_CODE'], message: 'REVIEW_PHONE and REVIEW_CODE go together' });
     }
     if (env.MAIL_DELIVERY === 'smtp' && (!env.SMTP_URL || !env.MAIL_FROM)) {
       ctx.addIssue({ code: 'custom', path: ['SMTP_URL'], message: 'smtp delivery needs SMTP_URL and MAIL_FROM' });

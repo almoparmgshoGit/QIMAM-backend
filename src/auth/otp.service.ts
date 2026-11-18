@@ -6,8 +6,8 @@ import type { OtpPurpose } from '../generated/prisma/enums.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { OtpDelivery } from './otp-delivery.js';
 
-const CODE_MAX = 1_000_000;
-const CODE_LENGTH = 6;
+const CODE_MAX = 10_000;
+const CODE_LENGTH = 4;
 const CODE_LIFETIME_MS = 5 * 60 * 1000;
 const RESEND_COOLDOWN_MS = 60 * 1000;
 const MAX_CODES_PER_HOUR = 5;
@@ -17,6 +17,8 @@ const HOUR_MS = 60 * 60 * 1000;
 export class OtpService {
   private readonly logger = new Logger(OtpService.name);
   private readonly pepper: string;
+  private readonly reviewPhone: string | undefined;
+  private readonly reviewCode: string | undefined;
 
   constructor(
     config: ConfigService,
@@ -24,6 +26,8 @@ export class OtpService {
     private readonly delivery: OtpDelivery,
   ) {
     this.pepper = config.getOrThrow<string>('OTP_PEPPER');
+    this.reviewPhone = config.get<string>('REVIEW_PHONE');
+    this.reviewCode = config.get<string>('REVIEW_CODE');
   }
 
   /**
@@ -31,8 +35,14 @@ export class OtpService {
    * registered. Delivery is not awaited, so its duration reveals nothing either.
    */
   async request(phone: string, purpose: OtpPurpose): Promise<void> {
+    // The App Review number gets its fixed code and no SMS. It is checked here like any other code, with the same limits.
+    const isReview = this.reviewPhone !== undefined && this.reviewCode !== undefined && phone === this.reviewPhone;
     // When the provider makes the code, this server never sees it and stores no hash.
-    const code = this.delivery.providerIssuesCodes ? null : String(randomInt(CODE_MAX)).padStart(CODE_LENGTH, '0');
+    const code = isReview
+      ? this.reviewCode!
+      : this.delivery.providerIssuesCodes
+        ? null
+        : String(randomInt(CODE_MAX)).padStart(CODE_LENGTH, '0');
     const now = Date.now();
 
     await this.prisma.$transaction(async (tx) => {
@@ -70,6 +80,7 @@ export class OtpService {
       });
     });
 
+    if (isReview) return;
     // A failed delivery looks like a code that never arrived, and the student can ask again after the cooldown.
     void this.delivery.deliver(phone, code).catch((error: unknown) => {
       this.logger.error(`Code delivery failed: ${error instanceof Error ? error.message : 'unknown error'}`);
