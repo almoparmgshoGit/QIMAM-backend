@@ -1,7 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { NotificationType } from '../generated/prisma/enums.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { APNS_TOKEN, ApnsClient } from './apns.js';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 /** The most messages Expo takes in one request. */
@@ -25,14 +26,16 @@ interface ExpoTicket {
 }
 
 /**
- * Sends stored notifications on to the student's phones through Expo's push service.
+ * Sends stored notifications on to the student's phones: an iPhone's own APNs token straight to Apple when the
+ * APNs key is set, and an Expo token through Expo's push service.
  * The notification is already saved, so a failure here only costs the banner, never the message.
  */
 @Injectable()
-export class PushService {
+export class PushService implements OnModuleDestroy {
   private readonly logger = new Logger('Push');
   private readonly accessToken: string | undefined;
   private readonly enabled: boolean;
+  private readonly apns: ApnsClient | null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -41,6 +44,22 @@ export class PushService {
     this.accessToken = config.get<string>('EXPO_ACCESS_TOKEN');
     // The tests must never reach a real service.
     this.enabled = config.get<string>('NODE_ENV') !== 'test';
+    const keyId = config.get<string>('APNS_KEY_ID');
+    const teamId = config.get<string>('APNS_TEAM_ID');
+    const key = config.get<string>('APNS_PRIVATE_KEY_BASE64');
+    this.apns =
+      keyId && teamId && key
+        ? new ApnsClient({
+            keyId,
+            teamId,
+            privateKey: Buffer.from(key, 'base64').toString('utf8'),
+            topic: config.get<string>('APNS_TOPIC') ?? 'com.qimam.quran',
+          })
+        : null;
+  }
+
+  onModuleDestroy(): void {
+    this.apns?.close();
   }
 
   async registerDevice(userId: string, pushToken: string, platform: 'IOS' | 'ANDROID'): Promise<void> {
@@ -68,8 +87,13 @@ export class PushService {
     const tokensByUser = new Map<string, string[]>();
     for (const { userId, pushToken } of devices) tokensByUser.set(userId, [...(tokensByUser.get(userId) ?? []), pushToken]);
 
-    const outgoing = messages.flatMap((message) =>
-      (tokensByUser.get(message.userId) ?? []).map((to) => ({
+    const pairs = messages.flatMap((message) => (tokensByUser.get(message.userId) ?? []).map((to) => ({ message, to })));
+    const direct = pairs.filter(({ to }) => APNS_TOKEN.test(to));
+    if (direct.length > 0) await this.deliverToApple(direct);
+
+    const outgoing = pairs
+      .filter(({ to }) => !APNS_TOKEN.test(to))
+      .map(({ message, to }) => ({
         to,
         title: message.title,
         body: message.body,
@@ -77,8 +101,7 @@ export class PushService {
         channelId: 'default',
         priority: 'high',
         data: { notificationId: message.id, type: message.type, ...message.opens },
-      })),
-    );
+      }));
 
     for (let start = 0; start < outgoing.length; start += BATCH) {
       const batch = outgoing.slice(start, start + BATCH);
@@ -93,6 +116,27 @@ export class PushService {
         this.logger.warn(`Push batch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  }
+
+  private async deliverToApple(pairs: { message: PushMessage; to: string }[]): Promise<void> {
+    if (!this.apns) {
+      this.logger.warn(`${pairs.length} iPhone push messages skipped: APNS_KEY_ID, APNS_TEAM_ID and APNS_PRIVATE_KEY_BASE64 are not set`);
+      return;
+    }
+    const apns = this.apns;
+    const results = await Promise.all(
+      pairs.map(({ message, to }) =>
+        apns.send(to, {
+          title: message.title,
+          body: message.body,
+          data: { notificationId: message.id, type: message.type, ...message.opens },
+        }),
+      ),
+    );
+    const gone = pairs.filter((_, index) => !results[index].ok && (results[index] as { gone: boolean }).gone).map(({ to }) => to);
+    if (gone.length > 0) await this.prisma.pushDevice.deleteMany({ where: { pushToken: { in: gone } } });
+    const failed = results.filter((r): r is Extract<typeof r, { ok: false }> => !r.ok && !r.gone);
+    if (failed.length > 0) this.logger.warn(`${failed.length} iPhone push messages refused: ${failed[0].reason}`);
   }
 
   private async post(batch: object[]): Promise<ExpoTicket[]> {

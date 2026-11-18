@@ -48,7 +48,10 @@ export const updateProfileSchema = z
 export type UpdateProfileDto = z.infer<typeof updateProfileSchema>;
 
 /** An Expo push token, such as ExponentPushToken[xxxxxxxx]. */
-const pushTokenSchema = z.string().regex(/^Expo(nent)?PushToken\[[A-Za-z0-9_-]{10,}\]$/, 'not an Expo push token');
+/** An Expo push token, or an iPhone's own APNs device token (hex) that the server sends to Apple directly. */
+const pushTokenSchema = z
+  .string()
+  .regex(/^(Expo(nent)?PushToken\[[A-Za-z0-9_-]{10,}\]|[0-9a-fA-F]{64,200})$/, 'not a push token');
 
 export const pushDeviceSchema = z.strictObject({ pushToken: pushTokenSchema, platform: z.enum(['ios', 'android']) });
 export type PushDeviceDto = z.infer<typeof pushDeviceSchema>;
